@@ -1,0 +1,2805 @@
+<html lang="en" data-remix-generation="1" data-editor-live="https://kool.tools/flickguy"><head>
+    <title>flickguy</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=0.5">
+    <!-- scripts-->
+    <script>async function start() {
+    // init player and editor
+    const player = await makePlayer();
+    const editor = await makeEditor();
+
+    // setup play/edit buttons to switch between modes
+    const play = ui.action("play", playFromEditor);
+    const edit = ui.action("edit", editFromPlayer);
+
+    const playerContainer = ONE("#player");
+    const editorContainer = ONE("#editor");
+
+    function showPlayer() {
+        playerContainer.hidden = false;
+        editorContainer.hidden = true;
+        player.enter();
+    }
+
+    function showEditor() {
+        playerContainer.hidden = true;
+        editorContainer.hidden = false;
+        editor.enter();
+    }
+
+    async function playFromEditor() {
+        await player.copyFrom(editor.stateManager);
+        showPlayer();
+    }
+
+    async function editFromPlayer() {
+        await editor.stateManager.copyFrom(player.stateManager);
+        showEditor();
+    }
+
+    // determine if there is a project bundle embedded in this page
+    const bundle = maker.bundleFromHTML(document);
+
+    if (bundle) {
+        // embedded project, load it in the player
+        editor.helpContainer.hidden = false;
+        await player.loadBundle(bundle);
+        showPlayer();
+    } else {
+        // no embedded project, start editor blank
+        await editor.resetProject();
+        showEditor();
+    }
+}
+
+    </script>
+    <script>"strict"
+const maker = {};
+const ui = {};
+
+/**
+ * @template TProject
+ * @typedef {(project: TProject) => string[]} maker.ManifestFunction
+ */
+
+/**
+ * @typedef {Object} ResourceData
+ * @property {string} type
+ * @property {any} data
+ */
+
+/**
+ * @typedef {Object.<string, ResourceData>} maker.ResourceBundle
+ */
+
+/**
+ * @template TProject
+ * @typedef {Object} maker.ProjectBundle
+ * @property {TProject} project
+ * @property {maker.ResourceBundle} resources
+ */
+
+/**
+ * @template TData
+ * @template TInstance
+ * @typedef {Object} maker.ResourceHandler
+ * @property {(data: TData) => Promise<TInstance>} load
+ * @property {(instance: TInstance) => Promise<TInstance>} copy
+ * @property {(instance: TInstance) => Promise<TData>} save
+ */
+
+/** @type {Map<string, maker.ResourceHandler<any, any>>} */
+maker.resourceHandlers = new Map();
+
+maker.ResourceManager = class {
+    constructor() {
+        this.lastId = 0;
+        /** @type {Map<string, { type: string, instance: any }>} */
+        this.resources = new Map();
+    }
+
+    /**
+     * Generate a new unique id for a resource.
+     * @returns {string}
+     */
+    generateId() {
+        this.lastId += 1;
+        // just next lowest unused number
+        while (this.resources.has(this.lastId.toString())) {
+            this.lastId += 1;
+        }
+
+        return this.lastId.toString();
+    }
+    
+    /**
+     * Clear all resources.
+     */
+    clear() {
+        this.resources.clear();
+    }
+
+    /**
+     * Get the resource instance with the given id.
+     * @param {string} id 
+     * @returns {any}
+     */
+    get(id) {
+        return this.resources.get(id)?.instance;
+    }
+
+    /**
+     * Add a resource instance at a specific id.
+     * @param {string} id 
+     * @param {any} instance 
+     * @param {string} type 
+     */
+    set(id, instance, type) {
+        this.resources.set(id, { type, instance });
+    }
+
+    /**
+     * Add an instance as a new resource and return its new id.
+     * @param {any} instance 
+     * @param {string} type 
+     * @returns {string}
+     */
+    add(instance, type) {
+        const id = this.generateId();
+        this.set(id, instance, type);
+        return id;
+    }
+
+    /**
+     * Copy the existing resource with the given id and add it as a new resource.
+     * @param {string} id 
+     * @returns 
+     */
+    async fork(id) {
+        const source = this.resources.get(id);
+        const forkId = this.generateId();
+        const instance = await maker.resourceHandlers.get(source.type).copy(source.instance); 
+        this.set(forkId, instance, source.type);
+        return { id: forkId, instance };
+    }
+
+    /**
+     * Discard all resources except those at the ids given.
+     * @param {Iterable<string>} keepIds 
+     */
+    prune(keepIds) {
+        const ids = new Set(keepIds);
+
+        this.resources.forEach((_, id) => {
+            if (!ids.has(id)) this.resources.delete(id);
+        });
+    }
+
+    /**
+     * Copy all resources from another resource manager.
+     * @param {maker.ResourceManager} other 
+     */
+    async copyFrom(other) {
+        const tasks = [];
+        Array.from(other.resources).forEach(([id, { type, instance }]) => {
+            const task = maker.resourceHandlers.get(type)
+                         .copy(instance)
+                         .then((copy) => this.set(id, copy, type));
+            tasks.push(task);
+        });
+
+        return Promise.all(tasks);
+    }
+
+    /**
+     * Save all resources in an object mapping id to type and save data.
+     * @param {Iterable<string>} ids 
+     * @returns {Promise<maker.ResourceBundle>}
+     */
+    async save(ids) {
+        /** @type {maker.ResourceBundle} */
+        const bundle = {};
+
+        const resourceIds = new Set(ids);
+        const relevant = Array.from(this.resources)
+                         .filter(([id]) => resourceIds.has(id));
+
+        const tasks = [];
+        Array.from(relevant).forEach(([id, { type, instance }]) => {
+            const task = maker.resourceHandlers.get(type)
+                         .save(instance)
+                         .then((data) => bundle[id] = { type, data });
+            tasks.push(task);
+        });
+
+        await Promise.all(tasks);
+        return bundle;
+    }
+
+    /**
+     * Load all resources from the given bundle.
+     * @param {maker.ResourceBundle} bundle 
+     */
+    async load(bundle) {
+        const tasks = [];
+        Object.entries(bundle).forEach(([id, { type, data }]) => {
+            const task = maker.resourceHandlers.get(type)
+                         .load(data)
+                         .then((instance) => this.set(id, instance, type));
+            tasks.push(task);
+        });
+        return Promise.all(tasks);
+    }
+}
+
+/**
+ * 
+ * @template TState
+ */
+maker.StateManager = class extends EventTarget {
+    /**
+     * Create a state manager, optionally providing a function that describes
+     * how to determine resource dependencies of a given state. 
+     * @param {maker.ManifestFunction<TState>} getManifest 
+     */
+    constructor(getManifest = undefined) {
+        super();
+
+        this.getManifest = getManifest || (() => []);
+        this.resources = new maker.ResourceManager();
+
+        /** @type {TState[]} */
+        this.history = [];
+        this.index = -1;
+        this.historyLimit = 20;
+    }
+
+    /**
+     * The present state in history.
+     */
+    get present() {
+        return this.history[this.index];
+    }
+
+    /**
+     * Is there any edit history to undo to?
+     */
+    get canUndo() {
+        return this.index > 0;
+    }
+
+    /**
+     * Are there any undone edits to redo?
+     */
+    get canRedo() {
+        return this.index < this.history.length - 1;
+    }
+
+    /**
+     * Replace all state with the project and resources in the given project
+     * bundle.
+     * @param {maker.ProjectBundle<TState>} bundle
+     */
+    async loadBundle(bundle) {
+        this.history.length = 0;
+        this.history.push(bundle.project);
+        this.index = 0;
+        this.resources.clear();
+        await this.resources.load(bundle.resources);
+
+        this.changed();
+    }
+
+    /**
+     * Replace all state by copying from another state manager.
+     * @param {maker.StateManager<TState>} other 
+     */
+    async copyFrom(other) {
+        this.history = COPY(other.history);
+        this.index = other.index;
+        this.resources.clear();
+        await this.resources.copyFrom(other.resources);
+        
+        this.changed();
+    }
+    
+    /**
+     * Copy the present state and dependent resources into a project bundle.
+     * @returns {Promise<maker.ProjectBundle<TState>>}
+     */
+    async makeBundle() {
+        const project = COPY(this.present);
+        const resources = await this.resources.save(this.getManifest(this.present));
+
+        return { project, resources };
+    }
+
+    /**
+     * Save the current state as a checkpoint in history that can be returned to
+     * with undo/redo.
+     */
+    makeCheckpoint() {
+        this.history.length = this.index + 1;
+        
+        const currentData = this.present;
+
+        this.history[this.index] = COPY(currentData);
+        this.history.push(currentData);
+        
+        if (this.index < this.historyLimit) {
+            this.index += 1;
+        } else {
+            // delete earliest history
+            this.history.splice(0, 1);
+            this.pruneResources();
+        }
+    }
+
+    /**
+     * Dispatch the change event signalling that the present state has been
+     * updated.
+     */
+    changed() {
+        this.dispatchEvent(new CustomEvent("change"));
+    }
+
+    /**
+     * Discard all resources that are no longer required accord to the manifest
+     * function.
+     */
+    pruneResources() {
+        this.resources.prune(this.history.flatMap(this.getManifest));
+    }
+
+    /**
+     * Make a history checkpoint, replace the current state with a forked
+     * version via callback, and then dispatch the change event.
+     * @param {(data: TState) => Promise} action 
+     */
+    async makeChange(action) {
+        this.makeCheckpoint();
+        await action(this.present);
+        this.changed();
+    }
+
+    /**
+     * Revert the state to the previous checkpoint in history.
+     */
+    undo() {
+        if (!this.canUndo) return;
+        this.index -= 1;
+        this.changed();
+    }
+
+    /**
+     * Return the state to the most recently undone checkpoint in history.
+     */
+    redo() {
+        if (!this.canRedo) return;
+        this.index += 1;
+        this.changed();
+    }
+};
+
+/**
+ * Ask the browser to download the given blob as a file with the given name.
+ * @param {Blob} blob 
+ * @param {string} name
+ */
+maker.saveAs = function(blob, name) {
+    const element = document.createElement("a");
+    const url = window.URL.createObjectURL(blob);
+    element.href = url;
+    element.download = name;
+    element.click();
+    window.URL.revokeObjectURL(url);
+};
+
+/**
+ * Open the browser file picker, optionally restricted to files of a given file
+ * type pattern and optionally accepting multiple files. 
+ * @param {string} accept 
+ * @param {boolean} multiple 
+ * @returns {Promise<File[]>}
+ */
+ maker.pickFiles = async function(accept = "*", multiple = false) {
+    return new Promise((resolve) => {
+        const fileInput = html("input", { type: "file", accept, multiple });
+        fileInput.addEventListener("change", () => resolve(Array.from(fileInput.files)));
+        fileInput.click();
+    });
+}
+
+/**
+ * Read plain text from a file.
+ * @param {File} file 
+ * @return {Promise<string>}
+ */
+maker.textFromFile = async function(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = reject;
+        reader.onload = () => resolve(/** @type {string} */ (reader.result));
+        reader.readAsText(file); 
+    });
+}
+
+/**
+ * Read image from a file.
+ * @param {File} file 
+ * @return {Promise<string>}
+ */
+maker.dataURIFromFile = async function(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = reject;
+        reader.onload = () => resolve(/** @type {string} */ (reader.result));
+        reader.readAsDataURL(file); 
+    });
+}
+
+/**
+ * Create a DOM for an html page from html source code
+ * @param {string} source
+ * @returns 
+ */
+maker.htmlFromText = function(source) {
+    const template = document.createElement('template');
+    template.innerHTML = source;
+    return template.content;
+}
+
+/**
+ * @param {string} text 
+ */
+maker.textToBlob = function(text, type = "text/plain") {
+    return new Blob([text], { type });
+}
+
+/**
+ * 
+ * @param {ParentNode} html 
+ */
+maker.bundleFromHTML = function(html, query="#bundle-embed") {
+    const json = ONE(query, html)?.textContent;
+    const bundle = json ? JSON.parse(json) : undefined;
+    return bundle;
+}
+
+class RadioGroupWrapper extends EventTarget {
+    /** @param {HTMLInputElement[]} inputs */
+    constructor(inputs) {
+        super();
+        this.inputs = inputs;
+
+        inputs.forEach((input) => {
+            input.addEventListener("change", () => {
+                if (!input.checked) return;
+                this.dispatchEvent(new CustomEvent("change"));
+            });
+        });
+    }
+
+    get selectedIndex() {
+        return this.inputs.findIndex((button) => button.checked); 
+    }
+
+    set selectedIndex(value) {
+        this.inputs[value].click();
+    }
+
+    get selectedInput() {
+        return this.inputs[this.selectedIndex];
+    }
+
+    get value() {
+        return this.selectedInput?.value;
+    }
+}
+
+class CheckboxWrapper extends EventTarget {
+    /** @param {HTMLInputElement[]} inputs */
+    constructor(inputs) {
+        super();
+        this.inputs = inputs;
+
+        inputs.forEach((input) => {
+            input.addEventListener("change", () => {
+                this.dispatchEvent(new CustomEvent("change"));
+                inputs.forEach((input) => input.checked = input.checked);
+            });
+        });
+    }
+
+    get checked() {
+        return this.inputs[0].checked; 
+    }
+
+    set checked(value) {
+        if (this.checked !== value) this.inputs[0].click();
+    }
+}
+
+class ButtonAction extends EventTarget {
+    /** @param {HTMLButtonElement[]} buttons */
+    constructor(buttons) {
+        super();
+        this.buttons = buttons;
+        this.disabled = false;
+
+        buttons.forEach((button) => {
+            button.addEventListener("click", () => this.invoke());
+        });
+    }
+
+    get disabled() {
+        return this._disabled;
+    }
+
+    set disabled(value) {
+        this._disabled = value;
+        this.buttons.forEach((button) => button.disabled = value);
+    }
+
+    invoke(force = false) {
+        if (!force && this.disabled) return;
+        this.dispatchEvent(new CustomEvent("invoke"));
+    }
+}
+
+/**
+ * Get a wrapper for the radio input elements sharing the given name.
+ * @param {string} name
+ * @returns {RadioGroupWrapper}
+ */
+ui.radio = (name) => new RadioGroupWrapper(ALL(`input[type="radio"][name="${name}"]`));
+
+ui.toggle = (name) => new CheckboxWrapper(ALL(`input[type="checkbox"][name="${name}"]`));
+
+/**
+ * Get an action linked to all button elements sharing the given name. 
+ * Optionally provide a default listener for the action.
+ * @param {string} name
+ * @param {() => void} listener
+ * @returns {ButtonAction}
+ */
+ui.action = function (name, listener=undefined) {
+    const action = new ButtonAction(ALL(`button[name="${name}"]`));
+    if (listener) action.addEventListener("invoke", listener);
+    return action;
+}
+
+/**
+ * Get the html select element with the given name.
+ * @param {string} name
+ * @returns {HTMLSelectElement}
+ */
+ui.select = (name) => ONE(`select[name="${name}"]`);
+
+/**
+ * Get a child element matching CSS selector.
+ * @param {string} query 
+ * @param {ParentNode} element 
+ * @returns {HTMLElement}
+ */
+const ONE = (query, element = undefined) => (element || document).querySelector(query);
+
+/**
+ * Get all children elements matching CSS selector.
+ * @param {string} query 
+ * @param {HTMLElement | Document} element 
+ * @returns {HTMLElement[]}
+ */
+const ALL = (query, element = undefined) => Array.from((element || document).querySelectorAll(query));
+
+ui.PointerDrag = class extends EventTarget {
+    /** 
+     * @param {MouseEvent} event
+     */
+    constructor(event, { clickMovementLimit = 5 } = {}) {
+        super();
+        this.pointerId = event["pointerId"];
+        this.clickMovementLimit = 5;
+        this.totalMovement = 0;
+
+        this.downEvent = event;
+        this.lastEvent = event; 
+
+        this.listeners = {
+            "pointerup": (event) => {
+                if (event.pointerId !== this.pointerId) return;
+
+                this.lastEvent = event;
+                this.unlisten();
+                this.dispatchEvent(new CustomEvent("up", { detail: event }));
+                if (this.totalMovement <= clickMovementLimit) {
+                    this.dispatchEvent(new CustomEvent("click", { detail: event }));
+                }
+            },
+
+            "pointermove": (event) => {
+                if (event.pointerId !== this.pointerId) return;
+
+                this.totalMovement += Math.abs(event.movementX);
+                this.totalMovement += Math.abs(event.movementY);
+                this.lastEvent = event;
+                this.dispatchEvent(new CustomEvent("move", { detail: event }));
+            }
+        }
+
+        document.addEventListener("pointerup", this.listeners.pointerup);
+        document.addEventListener("pointermove", this.listeners.pointermove);
+    }
+
+    unlisten() {
+        document.removeEventListener("pointerup", this.listeners.pointerup);
+        document.removeEventListener("pointermove", this.listeners.pointermove);
+    }
+}
+
+/**
+ * Wrap a pointer down event and track its subsequent movement until release.
+ * @param {PointerEvent} event 
+ * @returns {ui.PointerDrag}
+ */
+ui.drag = (event) => new ui.PointerDrag(event);
+
+/**
+ * @param {HTMLCanvasElement} canvas 
+ * @param {MouseEvent} event 
+ */
+ function mouseEventToCanvasPixelCoords(canvas, event) {
+    const bounds = canvas.getBoundingClientRect();
+    const [mx, my] = [event.clientX - bounds.x, event.clientY - bounds.y];
+    const scale = canvas.width / canvas.clientWidth; 
+    const [px, py] = [Math.floor(mx * scale), Math.floor(my * scale)];
+    return { x: px, y: py };
+}
+
+/**
+ * Deep copy an object by serializing it to json and parsing it again.
+ * @template T
+ * @param {T} object
+ * @returns {T}
+ */
+const COPY = (object) => JSON.parse(JSON.stringify(object));
+
+/**
+ * Create an array of zeroes to the given length.
+ * @param {number} length 
+ * @returns {number[]}
+ */
+const ZEROES = (length) => Array(length).fill(0);
+
+/**
+ * Create an array of a value repeated to the given length.
+ * @template T
+ * @param {number} length 
+ * @param {T} value
+ * @returns {T[]}
+ */
+ const REPEAT = (length, value) => Array(length).fill(value);
+
+/**
+ * Create an html element with the given attributes and children.
+ * @template {keyof HTMLElementTagNameMap} K
+ * @param {K} tagName 
+ * @param {*} attributes 
+ * @param  {...(Node | string)} children 
+ * @returns {HTMLElementTagNameMap[K]}
+ */
+ function html(tagName, attributes = {}, ...children) {
+    const element = /** @type {HTMLElementTagNameMap[K]} */ (document.createElement(tagName)); 
+    Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, value));
+    children.forEach((child) => element.append(child));
+    return element;
+}
+
+    </script>
+    <script>/**
+ * @param {number} width
+ * @param {number} height
+ * @returns {CanvasRenderingContext2D}
+ */
+function createRendering2D(width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d');
+    context.imageSmoothingEnabled = false;
+    return context;
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {string | CanvasGradient | CanvasPattern | undefined} fillStyle
+ */
+function fillRendering2D(rendering, fillStyle = undefined) {
+    if (fillStyle !== undefined) {
+        const prevStyle = rendering.fillStyle;
+        rendering.fillStyle = fillStyle;
+        rendering.fillRect(0, 0, rendering.canvas.width, rendering.canvas.height);
+        rendering.fillStyle = prevStyle;
+    } else {
+        rendering.clearRect(0, 0, rendering.canvas.width, rendering.canvas.height);
+    }
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering
+ * @param {CanvasRenderingContext2D} destination
+ */
+function copyRendering2D(rendering, destination = undefined) {
+    destination = destination || createRendering2D(rendering.canvas.width, rendering.canvas.height);
+    destination.canvas.width = rendering.canvas.width;
+    destination.canvas.height = rendering.canvas.height;
+    destination.drawImage(rendering.canvas, 0, 0);
+    return destination;
+}
+
+/**
+
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {number} width 
+ * @param {number} height 
+ */
+function resizeRendering2D(rendering, width, height) {
+    const copy = copyRendering2D(rendering);
+    rendering.canvas.width = width;
+    rendering.canvas.height = height;
+    rendering.drawImage(copy.canvas, 0, 0);
+}
+
+/**
+ * @callback pixelsAction
+ * @param {Uint32Array} pixels
+ */
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {pixelsAction} action 
+ */
+function withPixels(rendering, action) {
+    const imageData = rendering.getImageData(0, 0, rendering.canvas.width, rendering.canvas.height);
+    action(new Uint32Array(imageData.data.buffer));
+    rendering.putImageData(imageData, 0, 0);
+}
+
+/**
+ * @param {CanvasRenderingContext2D} mask 
+ * @param {string} style 
+ */
+function recolorMask(mask, style) {
+    const recolored = copyRendering2D(mask);
+    recolored.globalCompositeOperation = "source-in";
+    fillRendering2D(recolored, style);
+    return recolored;
+}
+
+/**
+ * @param {number} x0 
+ * @param {number} y0 
+ * @param {number} x1 
+ * @param {number} y1 
+ * @param {(x: number, y: number) => void} plot 
+ */
+// adapted from https://stackoverflow.com/a/34267311
+function lineplot(x0, y0, x1, y1, plot) {
+    x0 |= 0; y0 |= 0; x1 |= 0; y1 |= 0;
+
+    const steep = Math.abs(y1 - y0) > Math.abs(x1 - x0);
+    if (steep) [x0, y0, x1, y1] = [y0, x0, y1, x1];
+
+    const dx = Math.abs(x1 - x0);
+    const dy = Math.abs(y1 - y0);
+    const ystep = Math.sign(y1 - y0);
+    const xstep = Math.sign(x1 - x0);
+
+    let err = Math.floor(dx / 2);
+    let y = y0;
+
+    if (dx === 0 && dy === 0) {
+        plot(x0, y0);
+    }
+
+    for (let x = x0; x != (x1 + xstep); x += xstep) {
+        plot(steep ? y : x, steep ? x : y);
+        err -= dy;
+        if (err < 0) {
+            y += ystep;
+            err += dx;
+        }
+    }
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {number} x 
+ * @param {number} y 
+ * @param {number} color
+ */
+function floodfill(rendering, x, y, color, tolerance = 5) {
+    const [width, height] = [rendering.canvas.width, rendering.canvas.height];
+    withPixels(rendering, pixels => {
+        const queue = [[x, y]];
+        const done = new Array(width * height);
+        const initial = pixels[y * width + x];
+
+        const ir = initial >>>  0 & 0xFF;
+        const ig = initial >>>  8 & 0xFF;
+        const ib = initial >>> 16 & 0xFF;
+
+        function enqueue(x, y) {
+            const within = x >= 0 && y >= 0 && x < width && y < height;
+
+            if (within && !done[y * width + x]) {
+                const pixel = pixels[y * width + x];
+
+                const pr = pixel >>>  0 & 0xFF;
+                const pg = pixel >>>  8 & 0xFF;
+                const pb = pixel >>> 16 & 0xFF;
+                const dist = Math.abs(pr - ir) + Math.abs(pg - ig) + Math.abs(pb - ib);
+                
+                if (dist <= tolerance) queue.push([x, y]);
+            }
+        }
+
+        while (queue.length > 0) {
+            const [x, y] = queue.pop();
+            pixels[y * width + x] = color;
+            done[y * width + x] = true;
+
+            enqueue(x - 1, y);
+            enqueue(x + 1, y);
+            enqueue(x, y - 1);
+            enqueue(x, y + 1);
+        }
+    });
+};
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {number} x 
+ * @param {number} y 
+ * @param {number} color
+ * @returns {CanvasRenderingContext2D}
+ */
+ function floodfillOutput(rendering, x, y, color) {
+    const [width, height] = [rendering.canvas.width, rendering.canvas.height];
+    const output = createRendering2D(width, height);
+    withPixels(rendering, srcPixels =>
+    withPixels(output, dstPixels => {
+        const queue = [[x, y]];
+        const done = new Array(width * height);
+        const initial = srcPixels[y * width + x];
+
+        function enqueue(x, y) {
+            const within = x >= 0 && y >= 0 && x < width && y < height;
+
+            if (within && srcPixels[y * width + x] === initial && !done[y * width + x]) {
+                queue.push([x, y]);
+            }
+        }
+
+        while (queue.length > 0) {
+            const [x, y] = queue.pop();
+            dstPixels[y * width + x] = color;
+            done[y * width + x] = true;
+
+            enqueue(x - 1, y);
+            enqueue(x + 1, y);
+            enqueue(x, y - 1);
+            enqueue(x, y + 1);
+        }
+    }));
+    return output;
+};
+
+/**
+ * @param {{r:number,g:number,b:number}} rgb 
+ */
+function rgbToHex(rgb) {
+    const packed = (0xFF000000 + (rgb.r << 16) + (rgb.g << 8) + (rgb.b << 0));
+    return "#" + packed.toString(16).substr(-6);
+}
+
+/**
+ * @param {string} hex 
+ * @param {number} alpha
+ */
+function hexToUint32(hex, alpha = undefined) {
+    if (hex.charAt(0) === '#') hex = hex.substring(1);
+    if (alpha === undefined && hex.length === 8) alpha = parseInt(hex.substr(6, 2), 16);
+    if (alpha === undefined) alpha = 255;
+    hex = hex.substr(4, 2) + hex.substr(2, 2) + hex.substr(0, 2);
+    return (parseInt(hex, 16) | (alpha << 24)) >>> 0;
+}
+
+/**
+ * @param {number} number
+ * @param {string} prefix 
+ */
+function numberToHex(number, prefix = '#') {
+    number = (number | 0xff000000) >>> 0;
+    let hex = number.toString(16).substring(2, 8);
+    hex = hex.substr(4, 2) + hex.substr(2, 2) + hex.substr(0, 2);
+    return prefix + hex;
+}
+
+const MASK_PALETTE = {
+    '_': hexToUint32('#000000', 0),
+    default: hexToUint32('#FFFFFF', 255),
+};
+
+/**
+ * @param {string} text 
+ * @param {Record<string, number>} palette 
+ * @returns {CanvasRenderingContext2D}
+ */
+function textToRendering2D(text, palette = MASK_PALETTE) {
+    text = text.trim();
+    const lines = text.split('\n').map((line) => [...line.trim()]);
+
+    const width = lines[0].length;
+    const height = lines.length;
+
+    const rendering = createRendering2D(width, height);
+    withPixels(rendering, (pixels) => {
+        lines.forEach((line, y) => line.forEach((char, x) => {
+            const color = palette[char];
+            pixels[y * width + x] = color !== undefined ? color : palette.default;
+        }));
+    });
+
+    return rendering;
+}
+
+/**
+ * @param {{ h: number, s: number, v: number }} hsv
+ */
+function HSVToRGB(hsv) {
+    const { h, s, v } = hsv;
+    let r, g, b;
+    const i = Math.floor(h * 6);
+    const f = h * 6 - i;
+    const p = (1 - s);
+    const q = (1 - f * s);
+    const t = (1 - (1 - f) * s);
+    switch (i % 6) {
+        case 0: r = 1, g = t, b = p; break;
+        case 1: r = q, g = 1, b = p; break;
+        case 2: r = p, g = 1, b = t; break;
+        case 3: r = p, g = q, b = 1; break;
+        case 4: r = t, g = p, b = 1; break;
+        case 5: r = 1, g = p, b = q; break;
+    }
+
+    r *= v * 255;
+    g *= v * 255;
+    b *= v * 255;
+
+    return { r, g, b };
+}
+
+/**
+ * @param {{ r: number, g: number, b: number }} rgb
+ */
+function RGBToHSV(rgb) {
+    const { r, g, b } = rgb;
+    var max = Math.max(r, g, b), min = Math.min(r, g, b),
+        d = max - min,
+        h,
+        s = (max === 0 ? 0 : d / max),
+        v = max / 255;
+
+    switch (max) {
+        case min: h = 0; break;
+        case r: h = (g - b) + d * (g < b ? 6: 0); h /= 6 * d; break;
+        case g: h = (b - r) + d * 2; h /= 6 * d; break;
+        case b: h = (r - g) + d * 4; h /= 6 * d; break;
+    }
+
+    return { h, s, v };
+}
+
+function HSVToCone(hsv) {
+    const a = Math.PI * hsv.h;
+    const r = hsv.s * .5 * hsv.v;
+    const x = Math.cos(a) * r;
+    const y = Math.sin(a) * r;
+    return { x, y, z: hsv.v };
+}
+
+
+function uint32ToRGB(uint32) {
+    return {
+        r: uint32 >>>  0 & 0xFF,
+        g: uint32 >>>  8 & 0xFF,
+        b: uint32 >>> 16 & 0xFF,
+        uint32,
+    };
+}
+
+function hexToRGB(hex) {
+    if (hex.charAt(0) === '#') hex = hex.substring(1);
+    return {
+        b: parseInt(hex.substr(4, 2), 16),
+        g: parseInt(hex.substr(2, 2), 16),
+        r: parseInt(hex.substr(0, 2), 16),
+        uint32: hexToUint32(hex),
+    };
+}
+
+function RGBToUint32(rgb) {
+    return rgb.r | rgb.g << 8 | rgb.b << 16 | 0xFF << 24;
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {string[]} palette 
+ */
+function recolorToPalette(rendering, palette) {
+    const paletteConverted = palette.map((hex) => { 
+        const cone = HSVToCone(RGBToHSV(hexToRGB(hex)));
+        const uint32 = hexToUint32(hex);
+        return { ...cone, uint32 };
+    });
+    const mapping = new Map();
+
+    function chooseColor(uint32) {
+        const alpha = (uint32 >>> 24) < 16;
+        if (alpha) return 0;
+
+        const existing = mapping.get(uint32);
+        if (existing) return existing;
+
+        const actual = HSVToCone(RGBToHSV(uint32ToRGB(uint32)));
+        let bestSqrDistance = Infinity;
+        let best = paletteConverted[0];
+
+        for (let candidate of paletteConverted) {
+            const dx = Math.abs(actual.x - candidate.x);
+            const dy = Math.abs(actual.y - candidate.y);
+            const dz = Math.abs(actual.z - candidate.z);
+            const sqrDistance = dx*dx + dy*dy + dz*dz;
+            
+            if (sqrDistance < bestSqrDistance) {
+                bestSqrDistance = sqrDistance;
+                best = candidate;
+            }
+        }
+
+        mapping.set(uint32, best.uint32);
+        return best.uint32;
+    }
+
+    withPixels(rendering, (pixels) => {
+        for (let i = 0; i < pixels.length; ++i) {
+            pixels[i] = chooseColor(pixels[i]);
+        }
+    });
+}
+
+/** 
+ * Copy image contents to a new canvas rendering context.
+ * @param {HTMLImageElement} image 
+ */
+function imageToRendering2D(image) {
+    const rendering = createRendering2D(image.naturalWidth, image.naturalHeight);
+    rendering.drawImage(image, 0, 0);
+    return rendering;
+}
+
+/**
+ * Create an html image from a given src (probably a datauri).
+ * @param {string} src
+ * @returns {Promise<HTMLImageElement>}
+ */
+async function loadImage(src) {
+    return new Promise((resolve, reject) => {
+        const image = document.createElement("img");
+        image.addEventListener("load", () => resolve(image));
+        image.addEventListener("error", reject);
+        image.src = src;
+    });
+}
+
+    </script>
+    <script>const crewmaker = {};
+
+// add a resource type called "canvas-datauri" that describes how to load a
+// canvas rendering context from a datauri, how to copy one, and how to convert
+// one back into a datauri
+maker.resourceHandlers.set("canvas-datauri", {
+    load: async (data) => imageToRendering2D(await loadImage(data)),
+    copy: async (instance) => copyRendering2D(instance),
+    save: async (instance) => instance.canvas.toDataURL("image/png", 1),
+});
+
+/**
+ * @typedef {Object} CrewmakerDataLayerOption
+ * @property {string} image
+ * @property {number} palette
+ */
+
+/**
+ * @typedef {Object} CrewmakerDataLayer
+ * @property {CrewmakerDataLayerOption[]} options
+ */
+
+/**
+ * @typedef {Object} CrewmakerDataProject
+ * @property {string[][]} palettes
+ * @property {CrewmakerDataLayer[]} layers
+ */
+
+/** 
+ * @param {CrewmakerDataProject} data 
+ * @returns {string[]}
+ */
+crewmaker.getManifest = function (data) {
+    // layer option images are the only resource dependencies in a crewmaker
+    return data.layers.flatMap((layer) => layer.options.map((option) => option.image));
+}
+
+crewmaker.layerWidth = 128;
+crewmaker.layerHeight = 128;
+
+/** @returns {maker.ProjectBundle<CrewmakerDataProject>} */
+crewmaker.makeBlankBundle = function () {
+    const blank = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+    fillRendering2D(blank);
+    const layers = ZEROES(8).map(() => ({  
+        options: ZEROES(8).map(() => ({ image: "0", palette: 0 })),
+    }));
+    const project = { palettes: crewmaker.defaultPalettes, layers };
+    const resources = {
+        "0": { type: "canvas-datauri", data: blank.canvas.toDataURL() },
+    };
+
+    return { project, resources };
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {string[]} prev 
+ * @param {string[]} next 
+ */
+function swapPalette(rendering, prev, next) {
+    const mapping = new Map();
+    prev.forEach((hex, index) => mapping.set(hexToUint32(prev[index]), hexToUint32(next[index])));
+
+    withPixels(rendering, (pixels) => {
+        for (let i = 0; i < pixels.length; ++i) {
+            pixels[i] = mapping.get(pixels[i]) || pixels[i];
+        }
+    });
+}
+
+/**
+ * @param {CanvasRenderingContext2D} rendering 
+ * @param {string[]} prev 
+ * @param {string[]} next 
+ */
+ function swapPaletteSafe(rendering, prev, next) {
+    const mapping = new Map();
+    const prevUint32 = prev.map((hex) => hexToUint32(hex));
+    const nextUint32 = next.map((hex) => hexToUint32(hex));
+    prevUint32.forEach((_, i) => mapping.set(prevUint32[i], nextUint32[i]));
+    mapping.set(0, 0);
+
+    function addMissing(prev) {
+        let bestDistance = Infinity;
+        let bestNext = nextUint32[0];
+
+        const pr = prev >>>  0 & 0xFF;
+        const pg = prev >>>  8 & 0xFF;
+        const pb = prev >>> 16 & 0xFF;
+
+        for (let i = 0; i < prevUint32.length; ++i) {
+            const target = prevUint32[i];
+            const tr = target >>>  0 & 0xFF;
+            const tg = target >>>  8 & 0xFF;
+            const tb = target >>> 16 & 0xFF;
+
+            const dist = Math.abs(pr - tr) 
+                       + Math.abs(pg - tg) 
+                       + Math.abs(pb - tb);
+
+            if (dist < bestDistance) {
+                bestDistance = dist;
+                bestNext = nextUint32[i];
+            }
+        }
+
+        mapping.set(prev, bestNext);
+        return bestNext;
+    }
+
+    withPixels(rendering, (pixels) => {
+        for (let i = 0; i < pixels.length; ++i) {
+            const prev = pixels[i];
+            if (prev) pixels[i] = mapping.get(prev) || addMissing(prev);
+        }
+    });
+}
+
+/**
+ * @param {number} min 
+ * @param {number} max 
+ * @returns {number}
+ */
+ function getRandomInt(min, max) {
+    return Math.floor(Math.random() * (max - min)) + min;
+}
+
+// default palettes (8 palettes of 8 colors)
+crewmaker.defaultPalettes = [
+    ["#000000","#94216a","#ff2674","#ff80a4","#34111f","#73392e","#c76e46","#ffb762"],["#000000","#d62411","#ff8426","#ffd100","#73392e","#c76e46","#eb9c6e","#ffdaac"],["#000000","#007899","#10d275","#bfff3c","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#94216a","#ff2674","#ff80a4","#002859","#007899","#10d275","#bfff3c"],["#000000","#d62411","#ff8426","#ffd100","#1b1023","#002859","#007899","#68aed4"],["#000000","#002859","#007899","#68aed4","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#007899","#10d275","#bfff3c","#7f0622","#d62411","#ff8426","#ffd100"],["#000000","#002859","#007899","#68aed4","#7f0622","#d62411","#ff8426","#ffd100"]
+];
+
+// brush names and datauris
+crewmaker.brushes = [
+    { name: "1px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABlJREFUOI1jYBgFwx38/////0C7YRQMDQAApd4D/cefQokAAAAASUVORK5CYII=" },
+    { name: "2px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABpJREFUOI1jYBgFwx38hwJ8apjo5ZhRMKgBADvbB/vPRl6wAAAAAElFTkSuQmCC" },
+    { name: "3px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAACNJREFUOI1jYBgFgxz8////PyE1jMRoZmRkxKmOYheMgmEBAARbC/qDr1pMAAAAAElFTkSuQmCC" },
+    { name: "4px circle", image: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAChJREFUOI1jYBgFgxz8hwJ8ahjxaUZRyMiIVS0TeW4jEhDjhVEwGAAAJhAT9IYiYRoAAAAASUVORK5CYII=" },
+];
+
+crewmaker.Editor = class extends EventTarget {
+    constructor() {
+        super();
+
+        this.editorMode = true;
+
+        // to determine which resources are still in use for the project we
+        // combine everything the crewmaker needs plus anything this editor
+        // needs
+        const getManifest = (data) => [...crewmaker.getManifest(data), ...this.getManifest()];
+
+        /** @type {maker.StateManager<CrewmakerDataProject>} */
+        this.stateManager = new maker.StateManager(getManifest);
+        /** @type {CanvasRenderingContext2D} */
+        this.rendering = ONE("#renderer").getContext("2d");
+
+        this.stackActive = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+        this.stackUnder = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+        this.stackOver = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+        
+        this.preview = createRendering2D(this.rendering.canvas.width, this.rendering.canvas.height);
+        this.layerThumbs = ZEROES(8).map(() => createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight));
+        this.optionThumbs = ZEROES(8).map(() => createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight));
+        this.paletteThumbs = ZEROES(8).map(() => createRendering2D(1, 1));
+
+        // find all the ui already defined in the html
+        this.layerSelect = ui.radio("layer-select");
+        this.optionSelect = ui.radio("option-select");
+        this.paletteSelect = ui.radio("palette-select");
+        this.stackLayers = ui.toggle("stack-layers");
+
+        this.toolSelect = ui.radio("tool-select");
+        this.brushSelect = ui.radio("brush-select");
+        this.colorSelect = ui.radio("color-select");
+        this.helpContainer = ONE("#help");   
+
+        // initial selections
+        this.layerSelect.selectedIndex = 0;
+        this.optionSelect.selectedIndex = 0;
+        this.paletteSelect.selectedIndex = 0;
+
+        this.toolSelect.selectedIndex = 0;
+        this.brushSelect.selectedIndex = 0;
+        this.colorSelect.selectedIndex = 1;
+
+        this.selectedOptions = ZEROES(8);
+
+        // add thumbnails to the layer select bar
+        ALL("#layer-select input").forEach((input, index) => {
+            input.after(this.layerThumbs[index].canvas);
+        });
+
+        // add thumbnails to the option select bar
+        ALL("#option-select input").forEach((input, index) => {
+            input.after(this.optionThumbs[index].canvas);
+        });
+
+        // add thumbnails to the palette select bar
+        ALL("#palette-select input").forEach((input, index) => {
+            input.after(this.paletteThumbs[index].canvas);
+        });
+
+        // add brush icons and tooltips to brush select buttons
+        ALL("#brush-select label").forEach((label, index) => {
+            ONE("input", label).title = crewmaker.brushes[index].name + " brush";
+            ONE("img", label).src = crewmaker.brushes[index].image;
+        });
+
+        // state of the paint tools:
+        // is the color pick key held down?
+        this.heldColorPick = false;
+        // current brush and pattern recolored with current color
+        this.activeBrush = undefined;
+        this.activePattern = undefined;
+        // saved start coordinates during a line draw
+        this.lineStart = undefined;
+        // saved start coordinates during shift
+        this.shiftStart = undefined;
+        // layer option currently in the clipboard
+        this.copiedLayerOption = undefined;
+
+        // editor actions controlled by html buttons
+        this.actions = {
+            layerUp: ui.action("layer-up", () => this.shiftLayerUp()),
+            layerDown: ui.action("layer-down", () => this.shiftLayerDown()),
+
+            undo: ui.action("undo", () => this.stateManager.undo()),
+            redo: ui.action("redo", () => this.stateManager.redo()),
+            copy: ui.action("copy", () => this.copyLayerOption()),
+            paste: ui.action("paste", () => this.pasteLayerOption()),
+            clear: ui.action("clear", () => this.clearLayerOption()),
+            randomise: ui.action("randomise", () => this.randomise()),
+
+            export_: ui.action("export", () => this.exportProject()),
+            import_: ui.action("import", () => this.importProject()),
+            reset: ui.action("reset", () => this.resetProject()),
+            help: ui.action("help", () => this.toggleHelp()),
+
+            update: ui.action("update", () => this.updateEditor()),
+
+            exportImage: ui.action("export-image", () => this.exportImage()),
+
+            importPalette: ui.action("import-palette", () => this.importPalette()),
+        };
+
+        // can't undo/redo/paste yet
+        this.actions.undo.disabled = true;
+        this.actions.redo.disabled = true;
+        this.actions.paste.disabled = true;
+
+        // hotkeys
+        document.addEventListener("keydown", (event) => {
+            if (event.ctrlKey && event.key === "z") this.actions.undo.invoke();
+            if (event.ctrlKey && event.key === "y") this.actions.redo.invoke();
+            if (event.ctrlKey && event.key === "c") this.actions.copy.invoke();
+            if (event.ctrlKey && event.key === "v") this.actions.paste.invoke();
+            if (event.ctrlKey && event.key === "x") {
+                this.actions.copy.invoke();
+                this.actions.clear.invoke();
+            }
+
+            if (event.code === "KeyQ") this.toolSelect.selectedIndex = 0;
+            if (event.code === "KeyW") this.toolSelect.selectedIndex = 1;
+            if (event.code === "KeyE") this.toolSelect.selectedIndex = 2;
+            if (event.code === "KeyR") this.toolSelect.selectedIndex = 3;
+
+            if (event.code === "KeyA") this.brushSelect.selectedIndex = 0;
+            if (event.code === "KeyS") this.brushSelect.selectedIndex = 1;
+            if (event.code === "KeyD") this.brushSelect.selectedIndex = 2;
+            if (event.code === "KeyF") this.brushSelect.selectedIndex = 3;
+
+            this.heldColorPick = event.altKey;
+        });
+
+        document.addEventListener("keyup", (event) => {
+            this.heldColorPick = event.altKey;
+        });
+
+        // changes in layer select bar
+        this.layerSelect.addEventListener("change", () => {
+            this.refreshLayerDisplay();
+        });
+
+        this.optionSelect.addEventListener("change", () => {
+            // remember selected option for this layer
+            this.selectedOptions[this.layerSelect.selectedIndex] = this.optionSelect.selectedIndex;
+            this.refreshLayerDisplay();
+        });
+
+        // changes in palette select bar
+        this.paletteSelect.addEventListener("change", async () => {
+            const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+            const option = layer.options[this.optionSelect.selectedIndex];
+            
+            const prev = this.stateManager.present.palettes[option.palette];
+            const next = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+            
+            this.stateManager.makeCheckpoint();
+            const instance = await this.forkLayerOptionImage(option);
+            swapPaletteSafe(instance, prev, next);
+            option.palette = this.paletteSelect.selectedIndex;
+            this.stateManager.changed();
+
+            this.refreshColorSelect();
+        });
+
+        // changes in stack layers toggle
+        this.stackLayers.addEventListener("change", () => {
+            this.render();
+        });
+
+        // changes in the brush and pattern select bars
+        this.brushSelect.addEventListener("change", () => this.refreshActiveBrush());
+
+        // changes in the color select
+        this.colorSelect.addEventListener("change", () => {
+            this.refreshActiveBrush();
+        });
+    
+        // whenever the project data is changed
+        this.stateManager.addEventListener("change", () => {
+            this.refreshPaletteThumbs();
+            this.refreshLayerThumbnails();
+            this.refreshLayerDisplay();
+    
+            // enable/disable undo/redo buttons
+            this.actions.undo.disabled = !this.stateManager.canUndo;
+            this.actions.redo.disabled = !this.stateManager.canRedo;
+        });
+
+        // whenever a pointer moves anywhere on screen, update the paint cursors
+        // --listen on the whole document because for e.g line drawing it is 
+        // valid to move the mouse outside the edges of the drawing area
+        document.addEventListener("pointermove", (event) => {
+            const { x, y } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event);
+            this.refreshPreview(x, y);
+        });
+        
+        // finger or mouse presses on the drawing area--could begin a drag or
+        // end quickly in a click
+        this.rendering.canvas.addEventListener("pointerdown", async (event) => {
+            // for mouse ignore non-left-clicks
+            if (event.button !== 0) return;
+            // ignore in player mode
+            if (!this.editorMode) return;
+
+            // treat this as the beginning of a possible drag
+            const drag = ui.drag(event);
+            const { x, y } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event);
+
+            // prepare the plot function
+            const mask = createRendering2D(crewmaker.layerWidth, crewmaker.layerHeight);
+            const plotMask = (x, y) => mask.drawImage(this.activeBrush.canvas, (x - 7) | 0, (y - 7) | 0);
+            //const pattern = mask.createPattern(this.activePattern.canvas, 'repeat');
+            const drawPatternedMask = (instance) => {
+                //mask.globalCompositeOperation = "source-in";
+                //fillRendering2D(mask, pattern);
+                //mask.globalCompositeOperation = "source-over";
+
+                const erase = this.colorSelect.selectedIndex === 0;
+                instance.globalCompositeOperation = erase ? "destination-out" : "source-over";
+                instance.drawImage(mask.canvas, 0, 0);
+                instance.globalCompositeOperation = "source-over";
+                this.stateManager.changed();
+            };
+
+            // color picker selected or color pick hotkey held
+            if (this.toolSelect.value === "pick" || this.heldColorPick) {
+                drag.addEventListener("click", () => this.pickColor(x, y));
+            // flood fill selected
+            } else if (this.toolSelect.value === "fill") {
+                drag.addEventListener("click", () => this.floodFill(x, y));
+            // freehand drawing selected
+            } else if (this.toolSelect.value === "freehand") {
+                // fork the current options's image for editing and make an 
+                // undo/redo checkpoint
+                const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+                const option = layer.options[this.optionSelect.selectedIndex];
+                this.stateManager.makeCheckpoint();
+                const instance = await this.forkLayerOptionImage(option);
+
+                // draw the brush at the position the drag begins
+                plotMask(x, y);
+                drawPatternedMask(instance);
+
+                let prev = { x, y };
+
+                // draw the brush at the last position of the drag
+                drag.addEventListener("up", (event) => {
+                    const { x, y } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+                    plotMask(x, y);
+                    drawPatternedMask(instance);
+                });
+
+                // as the pointer moves, draw brush lines between the points
+                drag.addEventListener("move", (event) => {
+                    const { x: x0, y: y0 } = prev;
+                    const { x: x1, y: y1 } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+                    lineplot(x0, y0, x1, y1, plotMask);
+                    drawPatternedMask(instance);
+                    prev = { x: x1, y: y1 };
+                });
+            // line drawing selected
+            } else if (this.toolSelect.value === "line") {
+                // need to save this to draw the line preview
+                this.lineStart = { x, y };
+                this.refreshPreview(x, y);
+
+                // only actually draw the line at the end
+                drag.addEventListener("up", async (event) => {
+                    // fork the current options's image for editing and make an 
+                    // undo/redo checkpoint
+                    const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+                    const option = layer.options[this.optionSelect.selectedIndex];
+                    this.stateManager.makeCheckpoint();
+                    const instance = await this.forkLayerOptionImage(option);
+                    
+                    // line from pointer down position to pointer up position
+                    const { x: x0, y: y0 } = this.lineStart;
+                    const { x: x1, y: y1 } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+
+                    lineplot(x0, y0, x1, y1, plotMask);
+                    drawPatternedMask(instance);
+
+                    // stop tracking line drawing
+                    this.lineStart = undefined;
+                });
+            }  else if (this.toolSelect.value === "shift") {
+                this.shiftStart = { x, y };
+
+                drag.addEventListener("up", async (event) => {
+                    const { x: x0, y: y0 } = this.shiftStart;
+                    const { x: x1, y: y1 } = mouseEventToCanvasPixelCoords(this.rendering.canvas, event.detail);
+
+                    fillRendering2D(this.preview);
+                    this.preview.drawImage(this.stackActive.canvas, x1 - x0, y1 - y0);
+
+                    // fork the current options's image for editing and make an 
+                    // undo/redo checkpoint
+                    const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+                    const option = layer.options[this.optionSelect.selectedIndex];
+                    this.stateManager.makeCheckpoint();
+                    const instance = await this.forkLayerOptionImage(option);
+                    fillRendering2D(instance);
+                    instance.drawImage(this.preview.canvas, 0, 0);
+                    
+                    this.shiftStart = undefined;
+                    this.refreshPreview(x1, y1);
+                });
+            }
+        });
+    }
+
+    async init() {
+        // load all the brush images
+        this.brushRenders = await Promise.all(crewmaker.brushes.map(({ image }) => loadImage(image).then(imageToRendering2D)));
+        
+        // make brush and pattern valid
+        this.refreshActiveBrush();
+    }
+
+    /**
+     * @param {CrewmakerDataLayerOption} option 
+     * @returns {Promise<CanvasRenderingContext2D>}
+     */
+    async forkLayerOptionImage(option) {
+        // create a new copy of the image resource
+        const { id, instance } = await this.stateManager.resources.fork(option.image);
+        // replace the option's image with the new copy
+        option.image = id;
+        // return the instance of the image for editing
+        return instance;
+    }
+
+    render() {
+        // clear everything
+        fillRendering2D(this.stackActive);
+        fillRendering2D(this.stackUnder);
+        fillRendering2D(this.stackOver);
+        fillRendering2D(this.rendering);
+
+        // composite layers into below, current, above
+        this.stateManager.present.layers.forEach((layer, index) => {
+            // get the layer's current option scene's image
+            const option = layer.options[this.selectedOptions[index]];
+            const image = this.stateManager.resources.get(option.image);
+            
+            if (index < this.layerSelect.selectedIndex) this.stackUnder.drawImage(image.canvas, 0, 0);
+            if (index > this.layerSelect.selectedIndex) this.stackOver.drawImage(image.canvas, 0, 0);
+            if (index === this.layerSelect.selectedIndex) this.stackActive.drawImage(image.canvas, 0, 0);
+        });
+
+        // should other layers be drawn transparent?
+        const onion = this.editorMode && !this.stackLayers.checked;
+        const inactiveAlpha = onion ? .35 : 1;
+
+        // all layers below the active layer
+        this.rendering.globalAlpha = inactiveAlpha;
+        this.rendering.drawImage(this.stackUnder.canvas, 0, 0);
+        // the active layer + paint preview
+        this.rendering.globalAlpha = 1;
+        this.rendering.drawImage(this.stackActive.canvas, 0, 0);
+        this.rendering.drawImage(this.preview.canvas, 0, 0);
+        // all layers above the active layer
+        this.rendering.globalAlpha = inactiveAlpha;
+        this.rendering.drawImage(this.stackOver.canvas, 0, 0);
+        this.rendering.globalAlpha = 1;
+
+        // signal, to anyone listening, that rendering happened
+        this.dispatchEvent(new CustomEvent("render"));
+    }
+
+    refreshPreview(x, y) {
+        if (!this.editorMode || !this.activeBrush) return;
+
+        // clear existing preview
+        fillRendering2D(this.preview);
+
+        // prepare plot function
+        const plot = (x, y) => this.preview.drawImage(this.activeBrush.canvas, (x - 7) | 0, (y - 7) | 0);
+
+        const cursor = this.toolSelect.value === "shift" ? "move" : "crosshair";
+        this.rendering.canvas.style.setProperty("cursor", cursor);
+
+        if (this.shiftStart) {
+            const { x: ox, y: oy } = this.shiftStart;
+            this.preview.drawImage(this.stackActive.canvas, x - ox, y - oy);
+        } else if (this.heldColorPick) {
+            // no preview for color picking
+        } else if (this.lineStart) {
+            // draw a patterned line between the pointer down location and the
+            // current pointer location
+            const { x: x0, y: y0 } = this.lineStart;
+            lineplot(x0, y0, x, y, plot);
+            //this.preview.globalCompositeOperation = "source-in";
+            //fillRendering2D(this.preview, this.preview.createPattern(this.activePattern.canvas, 'repeat'));
+            //this.preview.globalCompositeOperation = "source-over";
+        } else if (this.toolSelect.value === "freehand" || this.toolSelect.value === "line") {
+            // draw the patterned brush at the current pointer location
+            plot(x, y);
+            //this.preview.globalCompositeOperation = "source-in";
+            //fillRendering2D(this.preview, this.preview.createPattern(this.activePattern.canvas, 'repeat'));
+            //this.preview.globalCompositeOperation = "source-over";
+        } 
+
+        this.render();
+    }
+
+    refreshLayerDisplay() {
+        this.actions.layerUp.disabled = this.layerSelect.selectedIndex < 1;
+        this.actions.layerDown.disabled = this.layerSelect.selectedIndex > 6;
+
+        // switch option to remembered option for this layer
+        this.optionSelect.selectedIndex = this.selectedOptions[this.layerSelect.selectedIndex];
+
+        // switch to the natural palette of this option
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        const option = layer.options[this.optionSelect.selectedIndex];
+        this.paletteSelect.selectedIndex = option.palette;
+
+        this.refreshLayerOptionThumbnails();
+        this.refreshColorSelect();
+        this.refreshActiveBrush();
+
+        this.render();
+    }
+
+    refreshActiveBrush() {
+        if (!this.stateManager.present) return;
+
+        //const pattern = this.patternRenders[this.patternSelect.selectedIndex];
+        const brush = this.brushRenders[this.brushSelect.selectedIndex];
+        const palette = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+        const color = palette[this.colorSelect.selectedIndex];
+        //if (!pattern || !brush || !color) return;
+        this.activeBrush = this.colorSelect.selectedIndex > 0 ? recolorMask(brush, color) : brush;
+        //this.activePattern = recolorMask(pattern, color);
+    }
+
+    refreshPaletteThumbs() {
+        // generate palette thumbnails
+        this.paletteThumbs.forEach((thumbnail, index) => {
+            const gap = 0;
+            const size = 12;
+            const pad = 0;
+
+            thumbnail.canvas.width = 4 * size + 3 * gap + pad * 2;
+            thumbnail.canvas.height = 2 * size + 1 * gap + pad * 2
+
+            const palette = this.stateManager.present.palettes[index];
+            for (let y = 0; y < 2; ++y) {
+                for (let x = 0; x < 4; ++x) {
+                    thumbnail.fillStyle = palette[y * 4 + x];
+                    thumbnail.fillRect(x * (size + gap) + pad, y * (size + gap) + pad, size, size);
+                }
+            }
+        });
+    }
+
+    refreshColorSelect() {
+        const palette = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+
+        // recolor the color select buttons to the corresponding color
+        ALL("#color-select label").forEach((label, index) => {
+            label.style.background = index > 0 ? palette[index] : "var(--trans-gradient)";
+        });
+    }
+
+    refreshLayerThumbnails() {
+        this.layerThumbs.forEach((thumbnail, index) => {
+            const layer = this.stateManager.present.layers[index];
+
+            fillRendering2D(thumbnail);
+
+            layer.options.forEach((layer) => {
+                const image = this.stateManager.resources.get(layer.image);
+                thumbnail.drawImage(image.canvas, 0, 0);
+            });
+
+            thumbnail.globalCompositeOperation = "source-in";
+            fillRendering2D(thumbnail, "#ffffff");
+            thumbnail.globalCompositeOperation = "source-over";
+        });
+    }
+
+    refreshLayerOptionThumbnails() {
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        this.optionThumbs.forEach((thumbnail, index) => {
+            fillRendering2D(thumbnail);
+            const image = this.stateManager.resources.get(layer.options[index].image);
+            thumbnail.drawImage(image.canvas, 0, 0);
+
+            thumbnail.globalCompositeOperation = "source-in";
+            fillRendering2D(thumbnail, "#ffffff");
+            thumbnail.globalCompositeOperation = "source-over";
+        });
+    }
+
+    floodFill(x, y) {
+        this.stateManager.makeChange(async (data) => {
+            // fork the current options's image
+            const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+            const option = layer.options[this.optionSelect.selectedIndex];
+            const instance = await this.forkLayerOptionImage(option);
+
+            const palette = this.stateManager.present.palettes[this.paletteSelect.selectedIndex];
+            const color = palette[this.colorSelect.selectedIndex];
+            const uint32 = this.colorSelect.selectedIndex > 0 ? hexToUint32(color) : 0;
+            floodfill(instance, x, y, uint32);
+
+            // find newly filled pixels
+            // const mask = floodfillOutput(instance, x, y, 0xFFFFFFFF);
+            // pattern the filled pixels
+            // mask.globalCompositeOperation = "source-in";
+            // fillRendering2D(mask, mask.createPattern(this.activePattern.canvas, 'repeat'));
+            // draw the final patterned fill
+            // instance.drawImage(mask.canvas, 0, 0);
+        });
+    }
+
+    pickColor(x, y) {
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        const option = layer.options[this.optionSelect.selectedIndex];
+        const instance = this.stateManager.resources.get(option.image);
+
+        const [r, g, b, a] = instance.getImageData(x, y, 1, 1).data;
+        const hex = rgbToHex({ r, g, b});
+        const palette = this.stateManager.present.palettes[option.palette];
+        
+        this.colorSelect.selectedIndex = a === 0 
+                                       ? 0
+                                       : palette.findIndex((color) => color === hex);
+    }
+
+    shiftLayerUp() {
+        if (this.layerSelect.selectedIndex < 1) return;
+
+        this.stateManager.makeChange(async (data) => {
+            const i = this.layerSelect.selectedIndex;
+            [data.layers[i-1], data.layers[i]] = [data.layers[i], data.layers[i-1]];
+            [this.selectedOptions[i-1], this.selectedOptions[i]] = [this.selectedOptions[i], this.selectedOptions[i-1]]
+            this.layerSelect.selectedIndex -= 1;
+            this.refreshLayerDisplay();
+        });
+    }
+
+    shiftLayerDown() {
+        if (this.layerSelect.selectedIndex > 6) return;
+
+        this.stateManager.makeChange(async (data) => {
+            const i = this.layerSelect.selectedIndex;
+            [data.layers[i], data.layers[i+1]] = [data.layers[i+1], data.layers[i]];
+            [this.selectedOptions[i], this.selectedOptions[i+1]] = [this.selectedOptions[i+1], this.selectedOptions[i]]
+            this.layerSelect.selectedIndex += 1;
+            this.refreshLayerDisplay();
+        });
+    }
+
+    copyLayerOption() {
+        // make a copy of option data and enable pasting
+        const layer = this.stateManager.present.layers[this.layerSelect.selectedIndex];
+        this.copiedLayerOption = COPY(layer.options[this.optionSelect.selectedIndex]);
+        this.actions.paste.disabled = false;
+    }
+
+    pasteLayerOption() {
+        this.stateManager.makeChange(async (data) => {
+            // replace selected layer option with a copy of the copied option
+            // --this is so it remains independent from the option kept in the
+            // clipboard
+            const layer = data.layers[this.layerSelect.selectedIndex];
+            layer.options[this.optionSelect.selectedIndex] = COPY(this.copiedLayerOption);
+        });
+    }
+
+    clearLayerOption() {
+        this.stateManager.makeChange(async (data) => {
+            const layer = data.layers[this.layerSelect.selectedIndex];
+            const option = layer.options[this.optionSelect.selectedIndex];
+            const instance = await this.forkLayerOptionImage(option);
+            fillRendering2D(instance);
+        });
+    }
+
+    async randomise() {
+        this.selectedOptions = ZEROES(8).map(() => getRandomInt(0, 8));
+        await this.stateManager.makeChange(async (data) => {
+            await Promise.all(data.layers.map(async (layer, index) => {
+                const option = layer.options[this.selectedOptions[index]];
+                const instance = await this.forkLayerOptionImage(option);
+
+                const prev = data.palettes[option.palette];
+                option.palette = getRandomInt(0, 8);
+                const next = data.palettes[option.palette];
+
+                swapPaletteSafe(instance, prev, next);
+            }));
+        });
+        this.refreshLayerDisplay();
+    }
+
+    /** @returns {string[]} */
+    getManifest() {
+        // the editor adds a dependency to the image in the copied scene, if any
+        // --we don't want this resource to be cleaned up accidentally because
+        // we might still want to paste it even after it stops being used in
+        // other scenes
+        return this.copiedLayerOption ? [this.copiedLayerOption.image] : [];
+    }
+
+    async exportProject() {
+        // make a standalone bundle of the current project state and the 
+        // resources it depends upon
+        const bundle = await this.stateManager.makeBundle();
+
+        // make a copy of this web page
+        const clone = /** @type {HTMLElement} */ (document.documentElement.cloneNode(true));
+        // remove some unwanted elements from the page copy
+        ALL("[data-empty]", clone).forEach((element) => element.replaceChildren());
+        ALL("[data-editor-only]", clone).forEach((element) => element.remove());
+        // insert the project bundle data into the page copy 
+        ONE("#bundle-embed", clone).innerHTML = JSON.stringify(bundle);
+
+        // track how many remixes this is (remixes have soft-limits to encourage finding updates)
+        const generation = parseInt(clone.getAttribute("data-remix-generation"));
+        clone.setAttribute("data-remix-generation", `${generation + 1}`);
+
+        // prompt the browser to download the page
+        const name = "flickguy.html";
+        const blob = maker.textToBlob(clone.outerHTML, "text/html");
+        maker.saveAs(blob, name);
+    }
+
+    async importProject() {
+        // ask the browser to provide a file
+        const [file] = await maker.pickFiles("text/html");
+        // read the file and turn it into an html page
+        const text = await maker.textFromFile(file);
+        const html = await maker.htmlFromText(text);
+        // extract the bundle from the imported page
+        const bundle = maker.bundleFromHTML(html);
+        // load the contents of the bundle into the editor
+        await this.stateManager.loadBundle(bundle);
+    } 
+
+    async resetProject() {
+        // open a blank project in the editor
+        await this.stateManager.loadBundle(crewmaker.makeBlankBundle());
+    }
+    
+    async updateEditor() {
+        const liveURL = document.documentElement.getAttribute("data-editor-live");
+        const bundle = await this.stateManager.makeBundle();
+        window.addEventListener("message", (event) => {
+            event.data.port.postMessage({ bundle });
+        });
+        console.log(window.open(liveURL));
+    }
+
+    exportImage() {
+        this.rendering.canvas.toBlob((blob) => {
+            maker.saveAs(blob, "your-character.png");
+        });        
+    }
+
+    toggleHelp() {
+        this.helpContainer.hidden = !this.helpContainer.hidden;
+    }
+
+    // for debugging
+    async importPalette() {
+        const [file] = await maker.pickFiles("image/*");
+        const dataUri = await maker.dataURIFromFile(file);
+        const image = await loadImage(dataUri);
+        const rendering = imageToRendering2D(image);
+
+        const prevPalettes = this.stateManager.present.palettes;
+        const nextPalettes = ZEROES(8).map(() => REPEAT(8, "#000000"));
+        withPixels(rendering, (pixels) => {
+            for (let p = 0; p < 8; ++p) {
+                for (let i = 1; i < 8; ++i) {
+                    nextPalettes[p][i] = rgbToHex(uint32ToRGB(pixels[p * 8 + i]));
+                }
+            }
+        });
+
+        await this.stateManager.makeChange(async (data) => {
+            data.palettes = nextPalettes;
+            const promises = data.layers.flatMap((layer) => { 
+                return layer.options.map(async (option) => {
+                    const instance = await this.forkLayerOptionImage(option);
+                    swapPaletteSafe(instance, prevPalettes[option.palette], nextPalettes[option.palette]);
+                });
+            });
+
+            return Promise.all(promises);
+        });
+    }
+
+    enterPlayerMode() {
+        this.editorMode = false;
+        ALL("[data-hidden-in-editor]").forEach((element) => element.hidden = false);
+        ALL("[data-hidden-in-player]").forEach((element) => element.hidden = true);
+        this.rendering.canvas.style.setProperty("cursor", "unset");
+        this.render();
+    }
+
+    enterEditorMode() {
+        this.editorMode = true;
+        ALL("[data-hidden-in-editor]").forEach((element) => element.hidden = true);
+        ALL("[data-hidden-in-player]").forEach((element) => element.hidden = false);
+        this.rendering.canvas.style.setProperty("cursor", "crosshair");
+        this.render();
+    }
+}
+
+crewmaker.start = async function () {
+    const editor = new crewmaker.Editor();
+    await editor.init();
+
+    // setup play/edit buttons to switch between modes
+    const play = ui.action("play", () => editor.enterPlayerMode());
+    const edit = ui.action("edit", () => editor.enterEditorMode());
+
+    // determine if there is a project bundle embedded in this page
+    const bundle = maker.bundleFromHTML(document);
+
+    if (bundle) {
+        // embedded project, load it in the player
+        await editor.stateManager.loadBundle(bundle);
+        editor.enterPlayerMode();
+    } else {
+        // no embedded project, start editor with default
+        const bundle = maker.bundleFromHTML(document, "#editor-embed");
+        await editor.stateManager.loadBundle(bundle);
+        //await editor.resetProject();
+        editor.enterEditorMode();
+    }
+
+    // if there's an opener window, tell it we're open to messages
+    if (window.opener) {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = async (event) => {
+            if (event.data.bundle) {
+                return editor.stateManager.loadBundle(event.data.bundle);
+            }
+        };
+        window.opener.postMessage({ port: channel.port2 }, "*", [channel.port2]);
+    }
+}
+
+    </script>
+    <!-- styles-->
+    <style id="base-style">
+/* prevent weird highlights https://stackoverflow.com/questions/21003535/ */
+.no-select {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    -khtml-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+}
+
+/* hidden elements should be hidden regardless of their display style */
+[hidden] { display: none !important; }
+
+/* default to width/height including padding and border */
+* { box-sizing: border-box; }
+
+/* used dynamically to prevent or cancel smooth transitions */
+.skip-transition { transition: none !important; }
+
+/* make buttons and select inherit font */ 
+button, select { font-family: inherit; font-size: inherit; }
+
+/* clickable things should use this cursor imo */
+button, a, input[type="radio"],  input[type="checkbox"], select, option, label { cursor: pointer; }
+
+/* crisp pixelart */
+canvas, img {
+    image-rendering: -moz-crisp-edges;
+    image-rendering: -webkit-crisp-edges;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+
+    </style>
+    <style id="main-style">:root {
+    --button-color: #ffd800;
+
+    --trans-color-1: rgb(32, 32, 32);
+    --trans-color-2: rgb(48, 48, 48);
+    --trans-gradient: repeating-linear-gradient( -45deg, var(--trans-color-1), var(--trans-color-1) .5em, var(--trans-color-2) .5em, var(--trans-color-2) 1em );
+
+    font-family: sans-serif;
+}
+
+html, body {
+    margin: 0; padding: 0;
+    width: 100vw; min-height: 100vh;
+}
+
+body {
+    display: flex; flex-direction: column;
+    justify-content: center;
+    align-items: center;
+
+    background: black;
+    color: white;
+}
+
+#editor {
+    display: flex; flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+
+html:not([data-remix-generation="0"]) [data-original-only] {
+    display: none !important;
+}
+
+html[data-remix-generation="0"] [data-remix-only] {
+    display: none !important;
+}
+
+#editor main {
+    padding: 1em;
+    background: #367b6b;
+    border-radius: 2em;
+    gap: 1em;
+}
+
+@media (max-width: 650px) {
+    #editor main {
+        width: 100vw;
+    }
+}
+
+h1, h2, h3, h4, h5, h6 {
+    margin: 0;
+}
+
+#help {
+    font-family: monospace;
+    font-size: large;
+
+    padding: 1em;
+
+    overflow: hidden scroll;
+}
+
+#help, #help > section {
+    display: flex;
+    flex-direction: column;
+    gap: 1em;
+}
+
+#help [name="help"] {
+    position: absolute;
+    top: 1em; right: 1em;
+}
+
+#help button {
+    padding: 0 1em;
+    height: 32px;
+}
+
+#help p {
+    margin: 0;
+}
+
+#help a {
+    color: var(--button-color);
+}
+
+#help a:hover {
+    color: white;
+}
+
+#help a:visited {
+    color: gray;
+}
+
+#help ul {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    margin: 0 1em;
+    padding: 0;
+    gap: .5em 1em;
+    list-style: none;
+
+    align-content: center;
+}
+
+#tool-select input[type="radio"]:checked + img {
+    filter: invert();
+}
+
+#color-select input[type="radio"]:checked {
+    background: none;
+    z-index: 5;
+
+    animation-name: selection-flash;
+    animation-direction: alternate;
+    animation-duration: 2s;
+    animation-iteration-count: infinite;
+}
+
+#viewport {
+    position: relative;
+    display: flex; flex-direction: column;
+    border-radius: 1em;
+
+    background: var(--trans-gradient);
+    padding: .65em;
+
+    justify-content: center;
+    align-items: center;
+
+    overflow: hidden;
+}
+
+#help {
+    position: absolute;
+    left: 0; top: 0;
+    width: 100%; height: 100%;
+    color: white;
+    background-color: #000000DD;
+    /* border-radius: 1em; */
+
+    display: flex;
+    flex-direction: column;
+    padding: 1em;
+    overflow: auto;
+}
+
+#renderer {
+    width: 640px;
+    height: 400px;
+    background: magenta;
+
+    touch-action: none;
+}
+
+.button-row {
+    display: flex;
+    flex-direction: row;
+    gap: 1em;
+}
+
+button {
+    flex: 1;
+    white-space: nowrap;
+
+    border: none;
+    border-radius: 1em;
+    background-color: var(--button-color);
+
+    font-weight: bold;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    padding: .25em;
+}
+
+button:active {
+    filter: invert();
+}
+
+button:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+.radio-select label {
+    position: relative;
+
+    margin: 0;
+    appearance: none;
+    -moz-appearance: none;
+    -webkit-appearance: none;
+    background-color: var(--button-color);
+
+    min-height: 3em;
+}
+
+.radio-select input[type="radio"] {
+    margin: 0;
+    appearance: none;
+    -moz-appearance: none;
+    -webkit-appearance: none;
+    border-radius: inherit;
+
+    position: absolute;
+    width: 100%; height: 100%;
+}
+
+.radio-select label img, .radio-select label svg, button img, button svg {
+    pointer-events: none;
+    width: 32px; height: 32px;
+}
+
+.radio-select label img, .radio-select label svg {
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+}
+
+.radio-select input[type="radio"]:checked {
+    border: none;
+    background: blue;
+}
+
+.radio-select img {
+    filter: brightness(0);
+}
+
+.radio-select svg {
+    color: black;
+}
+
+.radio-select input[type="radio"]:checked + svg {
+    color: white;
+}
+
+.radio-select input[type="radio"]:checked + img {
+    filter: none;
+}
+
+@keyframes selection-flash {
+    0%   { box-shadow: 0 0 0 .5em black; }
+    100% { box-shadow: 0 0 0 .5em white; }
+}
+
+.horizontal-capsule > *, .vertical-capsule > * {
+    flex: 1;
+}
+
+.horizontal-capsule {
+    display: flex;
+    flex-direction: row;
+}
+
+.vertical-capsule {
+    display: flex;
+    flex-direction: column;
+}
+
+.horizontal-capsule > :first-child {
+    border-radius: 1em 0 0 1em;
+}
+
+.horizontal-capsule > :last-child {
+    border-radius: 0 1em 1em 0;
+}
+
+.vertical-capsule > :first-child {
+    border-radius: 1em 1em 0 0;
+}
+
+.vertical-capsule > :last-child {
+    border-radius: 0 0 1em 1em;
+}
+
+:focus {
+    outline: thick solid white;
+    z-index: 5;
+}
+:focus:not(:focus-visible) { 
+    outline: unset 
+}
+
+:focus + * {
+    z-index: 5;
+}
+
+.hanging-menu {
+    display: flex;
+    flex-direction: row;
+    gap: 1em;
+
+    min-width: calc(100% - 4em);
+    height: 32px;
+}
+
+.hanging-menu button {
+    background-color: var(--button-color);
+
+    font-weight: bold;
+    padding-left: 1em;
+    padding-right: 1em;
+
+    border: none;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+}
+
+.grid4 {
+    display: grid;
+    grid-template-columns: repeat(4, auto);
+}
+
+.grid8 {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+}
+
+.grid4 label { border-radius: 0; }
+.grid4 label:nth-child(1) { border-top-left-radius: 1em; }
+.grid4 label:nth-child(4) { border-top-right-radius: 1em; }
+.grid4 label:nth-last-child(4) { border-bottom-left-radius: 1em; }
+.grid4 label:nth-last-child(1) { border-bottom-right-radius: 1em; }
+
+.grid8 label { border-radius: 0; }
+.grid8 label:nth-child(1) { border-top-left-radius: 1em; }
+.grid8 label:nth-child(8) { border-top-right-radius: 1em; }
+.grid8 label:nth-last-child(8) { border-bottom-left-radius: 1em; }
+.grid8 label:nth-last-child(1) { border-bottom-right-radius: 1em; }
+
+.grid8 label :not(input) { border-radius: inherit; }
+
+    </style>
+    <style id="crewmaker-style">#editor {
+    max-width: 100vw;
+}
+
+#editor main {
+    display: flex;
+    flex-direction: column;
+    gap: 1em;
+}
+
+#viewport {
+    padding: 0;
+    background: black;
+}
+
+#renderer {
+    max-width: 100%;
+    width: 512px;
+    height: auto;
+
+    background: var(--trans-gradient);
+}
+
+#stack-layers {
+    position: absolute;
+    top: 1em; right: 1em;
+    width: 60px;
+    height: 48px;
+
+    margin: 0;
+    background-color: var(--button-color);
+
+    border-radius: 1em;
+
+    opacity: 50%;
+}
+
+#stack-layers input {
+    appearance: none;
+    -moz-appearance: none;
+    -webkit-appearance: none;
+    margin: 0;
+    border-radius: inherit;
+
+    position: absolute;
+    width: 100%; height: 100%;
+}
+
+#stack-layers input + svg {
+    color: black;
+
+    pointer-events: none;
+    width: 32px; height: 32px;
+
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+}
+
+#stack-layers input:checked {
+    background: blue;
+}
+
+#stack-layers input:checked + svg {
+    color: white;
+}
+
+#layer-select {
+    gap: 2px;
+    flex: 1;
+}
+
+#layer-select label {
+    background-color: var(--button-color);
+}
+
+#layer-select *:checked + :not(input) {
+    background: blue;
+}
+
+#layer-select label :not(input) {
+    filter: invert();
+}
+
+#layer-select label *:checked + :not(input) {
+    filter: none;
+}
+
+#layer-select label :not(input) {
+    width: 100%; height: 100%;
+    position: absolute;
+    border-radius: inherit;
+}
+
+#option-select label :not(input) {
+    width: 100%; height: 100%;
+    position: absolute;
+    border-radius: inherit;
+    object-fit: contain;
+
+    image-rendering: auto;
+}
+
+#option-select *:checked + :not(input) {
+    background: blue;
+}
+
+#option-select label :not(input) {
+    filter: brightness(0);
+}
+
+#option-select label *:checked + :not(input) {
+    filter: none;
+}
+
+#palette-select label :not(input) {
+    position: absolute;
+    border-radius: none;
+
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+}
+
+#middle {
+    display: flex;
+    flex-direction: row;
+    gap: 1em;
+}
+
+#layer-options {
+    display: flex;
+    flex-direction: row;
+    gap: 1em;
+    align-items: stretch;
+}
+
+#option-select {
+    flex: 1;
+    gap: 2px;
+}
+
+#palette-select {
+    flex: 1;
+}
+
+#palette-select input[type="radio"]:checked {
+    background: blue;
+}
+
+#layer-select label {
+    min-width: 64px;
+}
+
+#tools {
+    display: grid;
+    gap: 1em;
+    grid-template-areas:
+        "tool   color"
+        "brush  color"
+        "bar    bar  ";
+}
+
+#tool-select {
+    grid-area: tool;
+
+    display: flex;
+    flex-direction: row;
+}
+
+#brush-select {
+    grid-area: brush;
+}
+
+#color-select {
+    grid-area: color;
+}
+
+#toolbar {
+    grid-area: bar;
+}
+
+#layer-select > :nth-child(2) {
+    border-radius: 1em 1em 0 0;
+}
+
+#layer-select > :nth-last-child(2) {
+    border-radius: 0 0 1em 1em;
+}
+
+#layer-select > button {
+    border-radius: 1em;
+}
+
+#layer-select > :first-child {
+    margin-bottom: 1em;
+}
+
+#layer-select > :last-child {
+    margin-top: 1em;
+}
+
+.vertical-capsule > :first-child[hidden] + * {
+    border-radius: 1em 1em 0 0;
+}
+
+.vertical-capsule > :first-child[hidden] ~ :nth-last-child(2) {
+    border-radius: 0 0 1em 1em;
+}
+
+    </style>
+  </head>
+  <body onload="crewmaker.start()">
+    <noscript>
+      &lt;h1&gt;this tool requires javascript&lt;/h1&gt;
+      &lt;p&gt;this is an interactive tool for drawing little guys and requires javascript to function correctly. if javascript is not available &lt;a href="https://kool.tools/blog/flickgame-study.html"&gt;you can read about it instead&lt;/a&gt;&lt;/p&gt;
+    </noscript>
+    <div id="editor">
+      <main>
+        <section id="middle">
+          <div class="vertical-capsule radio-select" id="layer-select">
+            <button name="layer-up" title="shift layer up" data-hidden-in-player=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-layer-forward" viewBox="0 0 16 16"><path d="M8.354.146a.5.5 0 0 0-.708 0l-3 3a.5.5 0 0 0 0 .708l1 1a.5.5 0 0 0 .708 0L7 4.207V12H1a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1H9V4.207l.646.647a.5.5 0 0 0 .708 0l1-1a.5.5 0 0 0 0-.708l-3-3z"></path><path d="M1 7a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h4.5a.5.5 0 0 0 0-1H1V8h4.5a.5.5 0 0 0 0-1H1zm9.5 0a.5.5 0 0 0 0 1H15v2h-4.5a.5.5 0 0 0 0 1H15a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-4.5z"></path></svg></button>
+            <label>
+              <input type="radio" name="layer-select" value="0" title="open layer 0"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="1" title="open layer 1"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="2" title="open layer 2"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="3" title="open layer 3"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="4" title="open layer 4"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="5" title="open layer 5"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="6" title="open layer 6"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="layer-select" value="7" title="open layer 7"><canvas width="128" height="128"></canvas>
+            </label>
+            <button name="layer-down" title="shift layer down" data-hidden-in-player="" disabled=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-layer-backward" viewBox="0 0 16 16"><path d="M8.354 15.854a.5.5 0 0 1-.708 0l-3-3a.5.5 0 0 1 0-.708l1-1a.5.5 0 0 1 .708 0l.646.647V4H1a1 1 0 0 1-1-1V1a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9v7.793l.646-.647a.5.5 0 0 1 .708 0l1 1a.5.5 0 0 1 0 .708l-3 3z"></path><path d="M1 9a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h4.5a.5.5 0 0 1 0 1H1v2h4.5a.5.5 0 0 1 0 1H1zm9.5 0a.5.5 0 0 1 0-1H15V6h-4.5a.5.5 0 0 1 0-1H15a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1h-4.5z"></path></svg></button>
+          </div>
+          <div id="viewport">
+            <canvas id="renderer" width="128" height="128" draggable="false" style="cursor: crosshair;"></canvas>
+            <label id="stack-layers" data-hidden-in-player="">
+              <input type="checkbox" name="stack-layers" title="show selected options for every layer at once"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-stack" viewBox="0 0 16 16"><path d="m14.12 10.163 1.715.858c.22.11.22.424 0 .534L8.267 15.34a.598.598 0 0 1-.534 0L.165 11.555a.299.299 0 0 1 0-.534l1.716-.858 5.317 2.659c.505.252 1.1.252 1.604 0l5.317-2.66zM7.733.063a.598.598 0 0 1 .534 0l7.568 3.784a.3.3 0 0 1 0 .535L8.267 8.165a.598.598 0 0 1-.534 0L.165 4.382a.299.299 0 0 1 0-.535L7.733.063z"></path><path d="m14.12 6.576 1.715.858c.22.11.22.424 0 .534l-7.568 3.784a.598.598 0 0 1-.534 0L.165 7.968a.299.299 0 0 1 0-.534l1.716-.858 5.317 2.659c.505.252 1.1.252 1.604 0l5.317-2.659z"></path></svg>
+            </label>
+            <div id="help" hidden="">
+              <button name="help" title="hide help">close</button>version 1 (6/18/2021)
+              <section data-remix-only=""><h1>remix</h1>
+<p>you are remixing a flickguy in an editor that is cloned from the original and may be out of date</p>
+<p>if you're intending to make your own flickguy consider clicking the "update" button to reopen your data in the latest online version of this editor--this will help reduce the proliferaton of bugs</p>
+<p>additionally the save feature is disabled in remixes to avoid a user's browser saves being scattered over many sites</p>
+<p>if you are modding the flickguy editor itself, or simply wish to enable the features hidden in remixes, you can edit the html to reset the "data-remix-generation" to "0" and change the "data-editor-live" to point to your modded version (this is what the "update" button uses)</p>
+
+              </section>
+              <section><h1>flickguy</h1>
+<p>i'm candle and this is my take on a low-effort picrew inspired by stephen lavelle's <a href="http://flickgame.org">flickgame</a> tool</p>
+<p>i made this tool to help iron out a web tool template i'm working on, <a href="https://kool.tools/blog/flickgame-study.html">read more about it on my website</a></p>
+<h2>format</h2>
+<p>a flickguy is a tool for making little guys by compositing layers. each layer
+has a selection of image options and those images can optionally be palette
+swapped for color variations</p>
+<p>this is a tool or creating flickguys by painting 8 image options for 8 layers. the exported flickguy also allows the user to "remix" it to either make bespoke
+adjustments to their guy or make a whole new derivative flickguy to let others use</p>
+<h2>hotkeys</h2>
+<ul>
+<li><strong>ctrl+z</strong>: undo</li>
+<li><strong>ctrl+y</strong>: redo</li>
+<li><strong>ctrl+c</strong>: copy image</li>
+<li><strong>ctrl+v</strong>: paste image</li>
+<li><strong>qwer</strong>: change tool</li>
+<li><strong>asdf</strong>: change brush</li>
+<li><strong>alt+click</strong>: pick color</li>
+</ul>
+<h2>credits</h2>
+<p>thanks to <a href="https://twitter.com/netgal_emi">em</a>, <a href="https://twitter.com/SeanSLeBlanc">sean</a>, <a href="https://twitter.com/jazzmickle">jazz</a> for testing and advice</p>
+<p>palettes sampled from <a href="https://lospec.com/palette-list/bubblegum-16">BUBBLEGUM 16</a> by <a href="https://twitter.com/PineTreePizza">pine</a></p>
+<p>icons from <a href="https://icons.getbootstrap.com/">bootstrap</a></p>
+
+              </section>
+            </div>
+          </div>
+        </section>
+        <section id="layer-options">
+          <div class="grid4 radio-select" id="option-select">
+            <label>
+              <input type="radio" name="option-select" value="0" title="open option 0"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="1" title="open option 1"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="2" title="open option 2"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="3" title="open option 3"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="4" title="open option 4"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="5" title="open option 5"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="6" title="open option 6"><canvas width="128" height="128"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="option-select" value="7" title="open option 7"><canvas width="128" height="128"></canvas>
+            </label>
+          </div>
+          <div class="grid4 radio-select" id="palette-select" title="palettes">
+            <label>
+              <input type="radio" name="palette-select" value="0" title="select palette 0"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="1" title="select palette 1"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="2" title="select palette 2"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="3" title="select palette 3"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="4" title="select palette 4"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="5" title="select palette 5"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="6" title="select palette 6"><canvas width="48" height="24"></canvas>
+            </label>
+            <label>
+              <input type="radio" name="palette-select" value="7" title="select palette 7"><canvas width="48" height="24"></canvas>
+            </label>
+          </div>
+        </section>
+        <section id="tools" data-hidden-in-player="">
+          <div class="horizontal-capsule radio-select" id="tool-select" title="tools">
+            <label>
+              <input type="radio" name="tool-select" value="freehand" title="freehand paint"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-brush" viewBox="0 0 16 16"><path d="M15.825.12a.5.5 0 0 1 .132.584c-1.53 3.43-4.743 8.17-7.095 10.64a6.067 6.067 0 0 1-2.373 1.534c-.018.227-.06.538-.16.868-.201.659-.667 1.479-1.708 1.74a8.118 8.118 0 0 1-3.078.132 3.659 3.659 0 0 1-.562-.135 1.382 1.382 0 0 1-.466-.247.714.714 0 0 1-.204-.288.622.622 0 0 1 .004-.443c.095-.245.316-.38.461-.452.394-.197.625-.453.867-.826.095-.144.184-.297.287-.472l.117-.198c.151-.255.326-.54.546-.848.528-.739 1.201-.925 1.746-.896.126.007.243.025.348.048.062-.172.142-.38.238-.608.261-.619.658-1.419 1.187-2.069 2.176-2.67 6.18-6.206 9.117-8.104a.5.5 0 0 1 .596.04zM4.705 11.912a1.23 1.23 0 0 0-.419-.1c-.246-.013-.573.05-.879.479-.197.275-.355.532-.5.777l-.105.177c-.106.181-.213.362-.32.528a3.39 3.39 0 0 1-.76.861c.69.112 1.736.111 2.657-.12.559-.139.843-.569.993-1.06a3.122 3.122 0 0 0 .126-.75l-.793-.792zm1.44.026c.12-.04.277-.1.458-.183a5.068 5.068 0 0 0 1.535-1.1c1.9-1.996 4.412-5.57 6.052-8.631-2.59 1.927-5.566 4.66-7.302 6.792-.442.543-.795 1.243-1.042 1.826-.121.288-.214.54-.275.72v.001l.575.575zm-4.973 3.04.007-.005a.031.031 0 0 1-.007.004zm3.582-3.043.002.001h-.002z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="line" title="line paint"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-slash-lg" viewBox="0 0 16 16"><path d="M14.707 1.293a1 1 0 0 1 0 1.414l-12 12a1 1 0 0 1-1.414-1.414l12-12a1 1 0 0 1 1.414 0z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="fill" title="flood fill"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-paint-bucket" viewBox="0 0 16 16"><path d="M6.192 2.78c-.458-.677-.927-1.248-1.35-1.643a2.972 2.972 0 0 0-.71-.515c-.217-.104-.56-.205-.882-.02-.367.213-.427.63-.43.896-.003.304.064.664.173 1.044.196.687.556 1.528 1.035 2.402L.752 8.22c-.277.277-.269.656-.218.918.055.283.187.593.36.903.348.627.92 1.361 1.626 2.068.707.707 1.441 1.278 2.068 1.626.31.173.62.305.903.36.262.05.64.059.918-.218l5.615-5.615c.118.257.092.512.05.939-.03.292-.068.665-.073 1.176v.123h.003a1 1 0 0 0 1.993 0H14v-.057a1.01 1.01 0 0 0-.004-.117c-.055-1.25-.7-2.738-1.86-3.494a4.322 4.322 0 0 0-.211-.434c-.349-.626-.92-1.36-1.627-2.067-.707-.707-1.441-1.279-2.068-1.627-.31-.172-.62-.304-.903-.36-.262-.05-.64-.058-.918.219l-.217.216zM4.16 1.867c.381.356.844.922 1.311 1.632l-.704.705c-.382-.727-.66-1.402-.813-1.938a3.283 3.283 0 0 1-.131-.673c.091.061.204.15.337.274zm.394 3.965c.54.852 1.107 1.567 1.607 2.033a.5.5 0 1 0 .682-.732c-.453-.422-1.017-1.136-1.564-2.027l1.088-1.088c.054.12.115.243.183.365.349.627.92 1.361 1.627 2.068.706.707 1.44 1.278 2.068 1.626.122.068.244.13.365.183l-4.861 4.862a.571.571 0 0 1-.068-.01c-.137-.027-.342-.104-.608-.252-.524-.292-1.186-.8-1.846-1.46-.66-.66-1.168-1.32-1.46-1.846-.147-.265-.225-.47-.251-.607a.573.573 0 0 1-.01-.068l3.048-3.047zm2.87-1.935a2.44 2.44 0 0 1-.241-.561c.135.033.324.11.562.241.524.292 1.186.8 1.846 1.46.45.45.83.901 1.118 1.31a3.497 3.497 0 0 0-1.066.091 11.27 11.27 0 0 1-.76-.694c-.66-.66-1.167-1.322-1.458-1.847z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="pick" title="pick color"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-eyedropper" viewBox="0 0 16 16"><path d="M13.354.646a1.207 1.207 0 0 0-1.708 0L8.5 3.793l-.646-.647a.5.5 0 1 0-.708.708L8.293 5l-7.147 7.146A.5.5 0 0 0 1 12.5v1.793l-.854.853a.5.5 0 1 0 .708.707L1.707 15H3.5a.5.5 0 0 0 .354-.146L11 7.707l1.146 1.147a.5.5 0 0 0 .708-.708l-.647-.646 3.147-3.146a1.207 1.207 0 0 0 0-1.708l-2-2zM2 12.707l7-7L10.293 7l-7 7H2v-1.293z"></path></svg>
+            </label>
+            <label>
+              <input type="radio" name="tool-select" value="shift" title="shift image"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrows-move" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M7.646.146a.5.5 0 0 1 .708 0l2 2a.5.5 0 0 1-.708.708L8.5 1.707V5.5a.5.5 0 0 1-1 0V1.707L6.354 2.854a.5.5 0 1 1-.708-.708l2-2zM8 10a.5.5 0 0 1 .5.5v3.793l1.146-1.147a.5.5 0 0 1 .708.708l-2 2a.5.5 0 0 1-.708 0l-2-2a.5.5 0 0 1 .708-.708L7.5 14.293V10.5A.5.5 0 0 1 8 10zM.146 8.354a.5.5 0 0 1 0-.708l2-2a.5.5 0 1 1 .708.708L1.707 7.5H5.5a.5.5 0 0 1 0 1H1.707l1.147 1.146a.5.5 0 0 1-.708.708l-2-2zM10 8a.5.5 0 0 1 .5-.5h3.793l-1.147-1.146a.5.5 0 0 1 .708-.708l2 2a.5.5 0 0 1 0 .708l-2 2a.5.5 0 0 1-.708-.708L14.293 8.5H10.5A.5.5 0 0 1 10 8z"></path></svg>
+            </label>
+          </div>
+          <div class="horizontal-capsule radio-select" id="brush-select" title="brushes">
+            <label>
+              <input type="radio" name="brush-select" value="0" title="1px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABlJREFUOI1jYBgFwx38/////0C7YRQMDQAApd4D/cefQokAAAAASUVORK5CYII=">
+            </label>
+            <label>
+              <input type="radio" name="brush-select" value="1" title="2px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAABpJREFUOI1jYBgFwx38hwJ8apjo5ZhRMKgBADvbB/vPRl6wAAAAAElFTkSuQmCC">
+            </label>
+            <label>
+              <input type="radio" name="brush-select" value="2" title="3px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAACNJREFUOI1jYBgFgxz8////PyE1jMRoZmRkxKmOYheMgmEBAARbC/qDr1pMAAAAAElFTkSuQmCC">
+            </label>
+            <label>
+              <input type="radio" name="brush-select" value="3" title="4px circle brush"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAChJREFUOI1jYBgFgxz8hwJ8ahjxaUZRyMiIVS0TeW4jEhDjhVEwGAAAJhAT9IYiYRoAAAAASUVORK5CYII=">
+            </label>
+          </div>
+          <div class="grid4 radio-select" id="color-select" title="colors">
+            <label style="background: var(--trans-gradient);">
+              <input type="radio" name="color-select" value="0" title="select color 0">
+            </label>
+            <label style="background-color: rgb(0, 40, 89);">
+              <input type="radio" name="color-select" value="1" title="select color 1">
+            </label>
+            <label style="background-color: rgb(0, 120, 153);">
+              <input type="radio" name="color-select" value="2" title="select color 2">
+            </label>
+            <label style="background-color: rgb(104, 174, 212);">
+              <input type="radio" name="color-select" value="3" title="select color 3">
+            </label>
+            <label style="background-color: rgb(127, 6, 34);">
+              <input type="radio" name="color-select" value="4" title="select color 4">
+            </label>
+            <label style="background-color: rgb(214, 36, 17);">
+              <input type="radio" name="color-select" value="5" title="select color 5">
+            </label>
+            <label style="background-color: rgb(255, 132, 38);">
+              <input type="radio" name="color-select" value="6" title="select color 6">
+            </label>
+            <label style="background-color: rgb(255, 209, 0);">
+              <input type="radio" name="color-select" value="7" title="select color 7">
+            </label>
+          </div>
+          <div class="button-row" id="toolbar" title="toolbar">
+            <button name="undo" title="undo"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-counterclockwise" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"></path><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"></path></svg></button>
+            <button name="redo" title="redo" disabled=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-clockwise" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"></path><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"></path></svg></button>
+            <button name="copy" title="copy image"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-files" viewBox="0 0 16 16"><path d="M13 0H6a2 2 0 0 0-2 2 2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2 2 2 0 0 0 2-2V2a2 2 0 0 0-2-2zm0 13V4a2 2 0 0 0-2-2H5a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1zM3 4a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4z"></path></svg></button>
+            <button name="paste" title="paste image"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-clipboard-data" viewBox="0 0 16 16"><path d="M4 11a1 1 0 1 1 2 0v1a1 1 0 1 1-2 0v-1zm6-4a1 1 0 1 1 2 0v5a1 1 0 1 1-2 0V7zM7 9a1 1 0 0 1 2 0v3a1 1 0 1 1-2 0V9z"></path><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"></path><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"></path></svg></button>
+            <button name="clear" title="clear image"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-trash" viewBox="0 0 16 16"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"></path><path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"></path></svg></button>
+            <button name="randomise" title="randomise selections"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-shuffle" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M0 3.5A.5.5 0 0 1 .5 3H1c2.202 0 3.827 1.24 4.874 2.418.49.552.865 1.102 1.126 1.532.26-.43.636-.98 1.126-1.532C9.173 4.24 10.798 3 13 3v1c-1.798 0-3.173 1.01-4.126 2.082A9.624 9.624 0 0 0 7.556 8a9.624 9.624 0 0 0 1.317 1.918C9.828 10.99 11.204 12 13 12v1c-2.202 0-3.827-1.24-4.874-2.418A10.595 10.595 0 0 1 7 9.05c-.26.43-.636.98-1.126 1.532C4.827 11.76 3.202 13 1 13H.5a.5.5 0 0 1 0-1H1c1.798 0 3.173-1.01 4.126-2.082A9.624 9.624 0 0 0 6.444 8a9.624 9.624 0 0 0-1.317-1.918C4.172 5.01 2.796 4 1 4H.5a.5.5 0 0 1-.5-.5z"></path><path d="M13 5.466V1.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384l-2.36 1.966a.25.25 0 0 1-.41-.192zm0 9v-3.932a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384l-2.36 1.966a.25.25 0 0 1-.41-.192z"></path></svg></button>
+            <button name="import-palette" title="restart with imported palette" hidden=""><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-palette" viewBox="0 0 16 16"><path d="M8 5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zm4 3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM5.5 7a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0zm.5 6a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"></path><path d="M16 8c0 3.15-1.866 2.585-3.567 2.07C11.42 9.763 10.465 9.473 10 10c-.603.683-.475 1.819-.351 2.92C9.826 14.495 9.996 16 8 16a8 8 0 1 1 8-8zm-8 7c.611 0 .654-.171.655-.176.078-.146.124-.464.07-1.119-.014-.168-.037-.37-.061-.591-.052-.464-.112-1.005-.118-1.462-.01-.707.083-1.61.704-2.314.369-.417.845-.578 1.272-.618.404-.038.812.026 1.16.104.343.077.702.186 1.025.284l.028.008c.346.105.658.199.953.266.653.148.904.083.991.024C14.717 9.38 15 9.161 15 8a7 7 0 1 0-7 7z"></path></svg></button>
+          </div>
+        </section>
+      </main>
+      <div class="hanging-menu" data-hidden-in-player="">
+        <button name="play" title="playtest this flickguy">play</button>
+        <button name="export" title="export as webpage">export</button>
+        <button name="update" title="open this flickguy in the latest version" data-remix-only="">update</button>
+        <button name="import" title="import from webpage" data-original-only="">import</button>
+        <button name="reset" title="reset to blank">reset</button>
+        <button name="help" title="how to use this tool">help</button>
+      </div>
+      <div class="hanging-menu" data-hidden-in-editor="" hidden="">
+        <button name="export-image" title="download as image">save image</button>
+        <button name="randomise" title="randomise selections">randomise</button>
+        <button name="edit" title="remix this flickguy">remix</button>
+      </div>
+    </div>
+    <script id="bundle-embed" type="application/json">{"project":{"palettes":[["#000000","#94216a","#ff2674","#ff80a4","#34111f","#73392e","#c76e46","#ffb762"],["#000000","#d62411","#ff8426","#ffd100","#73392e","#c76e46","#eb9c6e","#ffdaac"],["#000000","#007899","#10d275","#bfff3c","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#94216a","#ff2674","#ff80a4","#002859","#007899","#10d275","#bfff3c"],["#000000","#d62411","#ff8426","#ffd100","#1b1023","#002859","#007899","#68aed4"],["#000000","#002859","#007899","#68aed4","#430067","#94216a","#ff2674","#ff80a4"],["#000000","#007899","#10d275","#bfff3c","#7f0622","#d62411","#ff8426","#ffd100"],["#000000","#002859","#007899","#68aed4","#7f0622","#d62411","#ff8426","#ffd100"]],"layers":[{"options":[{"image":"3811","palette":0},{"image":"3712","palette":4},{"image":"3829","palette":1},{"image":"3775","palette":2},{"image":"3820","palette":0},{"image":"3793","palette":5},{"image":"3784","palette":1},{"image":"3838","palette":6}]},{"options":[{"image":"3839","palette":5},{"image":"3776","palette":6},{"image":"3812","palette":3},{"image":"3830","palette":0},{"image":"3650","palette":4},{"image":"3749","palette":5},{"image":"3758","palette":7},{"image":"3803","palette":6}]},{"options":[{"image":"3714","palette":0},{"image":"3831","palette":4},{"image":"3741","palette":1},{"image":"3840","palette":7},{"image":"3795","palette":7},{"image":"3813","palette":7},{"image":"3822","palette":7},{"image":"3786","palette":0}]},{"options":[{"image":"3814","palette":0},{"image":"3823","palette":6},{"image":"3751","palette":0},{"image":"3760","palette":7},{"image":"3841","palette":0},{"image":"3589","palette":7},{"image":"3832","palette":2},{"image":"3787","palette":7}]},{"options":[{"image":"3779","palette":1},{"image":"3734","palette":7},{"image":"3752","palette":0},{"image":"3743","palette":2},{"image":"3842","palette":2},{"image":"3797","palette":4},{"image":"3716","palette":4},{"image":"3824","palette":6}]},{"options":[{"image":"3816","palette":3},{"image":"3798","palette":5},{"image":"3494","palette":5},{"image":"3699","palette":3},{"image":"3771","palette":3},{"image":"3843","palette":7},{"image":"3807","palette":3},{"image":"3825","palette":6}]},{"options":[{"image":"3754","palette":2},{"image":"3817","palette":4},{"image":"3835","palette":0},{"image":"3808","palette":3},{"image":"3745","palette":2},{"image":"3826","palette":4},{"image":"3844","palette":7},{"image":"3772","palette":7}]},{"options":[{"image":"3711","palette":4},{"image":"3801","palette":6},{"image":"3738","palette":3},{"image":"3819","palette":1},{"image":"3837","palette":1},{"image":"3846","palette":7},{"image":"3792","palette":3},{"image":"3810","palette":7}]}]},"resources":{"781":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3494":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACOklEQVR4Ae3X0U3DMBQF0IBYhUnYgCX4Yhq+WIINmIRhQP54UuQGGqexHZxTCaWN2tg+98Yo0+RFgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgTOK/A0vXynv6MI3B9lIubRR+Cuz7DnHHXpzv+c3rtmYAfo3MWlUrScUtf2tVxo77GuBd1rJ1CABs24Fv58Cq2LoABz/UrvSwoQU2hVBAUI8YrHLQXIp1OrEAqQS+/8eY/wt0xpbWE8BWzRHeg3CjBQmLGUtXd/+r4ChNogx5LwFWCQ0GMZpeErQMgNcNwSflr2wwBr/1dLePx4vZjv1/PbxblWJzwGNpCOR8Gl8H8bfm0ptt75Ma4ChETFYxQgDVFSgnxKeSluDT9d31NArnzQzzXCT0u1AzQK/JZdoFb4CtAo/BhmXoJ07q9/B3no6ft7bPnpOvOXHWCuUfl9XoCS4WqEn8ZXgJIUdvpuSRFqBb/TUlyGAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECZxb4Ae5YQI/dHrc+AAAAAElFTkSuQmCC"},"3589":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABsElEQVR4Ae3WWw6CMBAF0OJq3JFhhcTl+Odu6osYQkwzgDE6HhO/2sHOuSNQig8BAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIEGgI7PvaWLU0CuxSSgg/Zayxpm7hG4CYVbpdwv+hSN/5LxX86uC71ZVbC18NwHmIn2dev6R269kT1cfBP9H0PNTGb9bjULpD/9gh/IZUpqXrgNRTeX697GUKN9rLOAT38BfcMaKX/7d93/UIiOhPQ3frj4gl3DMdgoTtaYkAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAgUwCFzwdMMKlEez5AAAAAElFTkSuQmCC"},"3650":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABNklEQVR4Ae3QMQEAAADCoPVPbQwfiEBhwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwb+AwMAjwABWBXfzAAAAABJRU5ErkJggg=="},"3699":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAC9UlEQVR4Ae3Z623bMBQG0LjIMN2lC7RAhskwBdoFuku3ccCiDAhC1oO8ZIj2+I8tS6Kuz/0oyfbTkwcBAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAusK3NYtTWW7Ap+/3TfX//5xqaeXNt48oDfnCGw0/P71y/uxb68vTb1s2un9qF6MFThoej54a/PT/gKQFVd6LhpfzvKtEnuan8Z73hrUex8gUDQ9Hf2o8VEVCkCUZOs4fxs/q+F1mS4BtciM5WK29zS+9/SfPqozwIyGl8f44BlflpJeC0AtMmo5aNZHlycA0aJb4y0268sS3QOUGtGvJ8z63vsAZ4DopqfxisanxZ4bvbT/yMenkYMbe3zz76/ft/8TOInvEnAS6vRm1exP+5VngNvPX6eHyhuW++f36ufWS4EA1JK9yxsB6B3y0f51MFpCIACPdFven9j8h+X5O/ghzfgVnQGoZ/RewYeXkpNBcAbYU7667mIArjT8TCktlwBfA8/IBm0T3fCIsgQgQvHEGCOb3zLzc8kCkCUGPY9sfCq5p/l/9h/0uf/fYQ/uAyID0dv81CS/BE6Oarp7P7yDn1iTbwEjsA/OAvUhW84KEbM/1SEAdTeili+GoD7sUSgEoBZbdXlQEARg1YZv1dUZgjxkeVaICoCbwKw78jn9LHvyp9m9MkbcPArAnnj0ugVDIADRTT4aL58NesMQdFnxLeCoYbPWtza0M0gCMKvBV49zJRAdIRCAq41ZYfs6HB0BWOHjqIEAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAg8M8IvAErVnpsFEZWowAAAABJRU5ErkJggg=="},"3711":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABNklEQVR4Ae3QMQEAAADCoPVPbQwfiEBhwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwb+AwMAjwABWBXfzAAAAABJRU5ErkJggg=="},"3712":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3714":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACEUlEQVR4Ae3WsU3DQBQGYINYgAlYIkzAFpTMQE1BDWuwAhU1BanYgAkYwegJXfQSQZRzQcS7z82dnbPi9/3Pl0yTgwABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgACB4wucHP8R/uYJ5ueb+advur1fT4+v78M47Bqc7l6oeL4v/Kg3Pv9tTUWPXFP5BugJtmdtRvzP8/IN0BvOaE1w1gs0wvrWBJfXL5ty158fJf8nlN4BWpCbFBdOqoYfHKUbYGHeW7dVDr90Axzy9j/crbbCzid5+8/Xq81L/q5FSKvzi/nt6WpRXi386m9/4JRugCiwpwla8HHfCOFHnWUbIIqLXSDGOPY1wojBf6sUb4BWZG6E1gw59Lg2yhvfTNpYegdoReYxN8OooWcPcwIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAgQMFvgC9yFBVfXvKSQAAAABJRU5ErkJggg=="},"3716":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAB3UlEQVR4Ae3W0Q3CIBQFUDSO4zRO4UhO4TTuo8GEhDQ1qUAQ7PGHamzLO/cVGoIPAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQJzCxzmnv68s7/eH8+12d8u566ZdL3ZWsF7+u1T6EuDnk1wWt7c97YCW0Nve9ftV9MA262++ufowadiNECSaDTOEnwq95gOjPUCs4UfK/YSWJ/7+wqtwu/5AqgBdh5+LN8WUNkErZ78ymkUn24LKKYLoVX4vZf9vGQrQK6xw2MrQGHo//D0x9KtAIUN0OK0Xy79af4aIEl0HkcIP5ZsC6gIvnQbGCV8DVARfn7qN40wUvh5DY4JECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQI7EvgBWQ7MNpiDJNiAAAAAElFTkSuQmCC"},"3734":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACEUlEQVR4Ae3WQW7CMBAFUFpxmF6pJ+yVuA3IUhN5YQjjsSMCjw1uWg/j9yehp5MXAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQLHE/g6Xstv3PHP7zV8ustfKsPU5nCzn76hJ+CIWccwGIAIcORvZ4dd99IR/LLdACwSo973DL70nAi/bDcARWHU62Dhl2MbgCOGn7zr6yOf6x+sOwT2vuvrFrc++4lB8QSoQXvWWyH01Jyx584wGIAM9sjwWwGNrF/O2fgMXwGZAcjsbYSRKbfuDdb1BFjlgoueuzMSzrP1IzUbR/xuXHNphkAyqGZLA2r6CmjKDrw4IKS1m5G1/osagFV38CITVuvxn6n34Gj+B3iAs/mrWUHVdScFv5zNACwSr/K+Y/ivcmR91AL1ANTXrQkQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBOYJ3ABb7j2eJFLl5gAAAABJRU5ErkJggg=="},"3738":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADdUlEQVR4Ae3bW3LTMBQG4IZhLTyzHoZlsIAsgGUwrIdnNpNWmSqNQyxL1vEl5MsMkzrRzd/5I7stfXnxIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQGAgcBkcBB6fjr9PtMIfj9/B5budwPE8gvDD3AnBe2u8/gxUe/v4Mn3swgYMqgcWKcPry45+d4N6KBOGeynqvLRaAfAo1QRCCrLX+86f1p7w/4+il435zrwYJbB6A609/CoEgBFW2cpjNA3BZ59VN4jkIlfcQl/6+mCXQHYCaa3zNys47QQpBDsK3ry9RY9fM/6xtugKQC5SfWxGvt/+xvnPHHhvP60OB2QFYojCXQFzvBG/rXWKuIcPzHjUHIBVjqYKUxi2997zl6z/zpgCU7tAVqL8YW4xQHYBS8bdYuDljBKoCcCl+vkMfmbtnF5jqe7k/GJnby/MEJgNQW/w8/VQhc7uWZ8Vv0WprWwxAa/Hbpv5oXQqN4n84LfFVMQDnCd+3/VSI/G9qIaWC3vZtaXvb13G/wOzfBtYULgWm1K7m/f5TNEJJYNEApImnijy2uNRv7D2vxwl0IZc+3b1LFIBewbr+0/cAdeOEtlL8UM7iYF07QBo5ehdQ/GK9wt/8HD7izAEVfiZcZ7fuS4DCdVZg4+7dl4C8/p5LgRBlxfWfu3eAvGRFzBKP9RwWgHTaQvBYxU+rDQ3AnNMXmjlqcX3C7gHSklrvAxQ/rpBzRwrbAVqLP3fB+sUKhAWgdVk+/a1iy7TfLADLnI5RWwU2CYBPf2uZlmu/SQCWOx0jtwoIQKvYf9Z+vQC8/a1fetj+95WgsAAUC/te/H2dutUkgbAApMGKIUgNPHYnEBoAPwzaXX0nFxQagMnZNNidwDr/I2jiT8p2p/JECwrbAWz/j5masAA85ulb9TqXgOScvxU8Qt+TwOo7gEvFnsof/HOAfZ2a1dQIrLcD5O8E8qWgZnXaLC7wCnFkvwHKhkYhAAAAAElFTkSuQmCC"},"3741":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABu0lEQVR4Ae3XXQqCQBAAYIsu4B16qet0zq5TL93BIyRDrCgJEgtCs58P4s/qOt/Mrtp1FgIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQGBvgcPeHe7Z3+Pcv2v6u76G1D5hc6oB+odrL/fh6zGft346tnV+aph045g0ruqwWhj9gZS6ACKJ89FeXRUJb5D+FbCWs7Vpv7RrrWBSzwC/JrUkv5XpP3zSf+VGkPO/gbXRXxIfbVtKfsTbRAFEoLHMC+FzZLluLfnL6O0RIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECWwIj5+4hpYAzq2QAAAAASUVORK5CYII="},"3743":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACUUlEQVR4Ae3XW07DMBAF0ILYSLeHWA5ieyyl4N+R7djJ5KHoIPHRxB47506S9vHwR4AAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIBAX+D7+fkq//1R1zj7cY1t3GcXmcHHWl+/P2/ZUhogUTQGtqZ0Ro2ZddM7ambxO42Nwc3erXF+tJmtF+e3PnsCtGQGjy8FN1Imo8bIOrUxngA1lcFjreBG7tbW3NrSI/Vq80aOeQKMKE2MWQprJviy7FK9ia1Vh2qAKkv/4GyIpdqaOf1d5Jz1Cph07AXZult7c3rLt+r15sye0wATYr0ga2H1xi8tW6u3NGfNea+ANWphTgxrS/Ch9O4f33df4UYLxKD3urSj1in79wpISjHzrj+yATwBkhogq8yR4Zc9a4Cs5BLqHB2+BkgILavEGeFrgKz0/uucFeDWS/AlcKtgmL/my+CZzaMBQoBZH0cb4czwy7VqgKzEG3V6jXB2+BqgEdoeh2MjXCH8cp1+Bu6RtpoECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQLXF/gDM3lganFdNiAAAAAASUVORK5CYII="},"3745":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAB9UlEQVR4Ae3aQQrCMBAFUBWP5caTu/FeShaDg201Qhcm8wQxTWpN3nwjBQ8HDwIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgsJ/A7XF5tOd+V6x7pdNoS1f4fSs2XADa8q/H+3FfBlcbQiB/+3N7iMn/6STPfzqvj9Nqxe/ZBXJIes7/+KGTDg4ZgJ5aRPGj8O/HPdeocM6wAYiCRpGi0HHcXnNfa7+/J59btT1cAKKIubitb62/alF/WfcUdwEtDDkQvwA4dzKB2AniNS9vrS+PV2wPuQN8K5RCfxN6jU8XAD8Fr+L2tKYLwNai7QrrMmUC0JZvd1iGoFQAlsvXIwDFMyAAAlBcoPjyS+wA7gC2Uz7lHyvWCu4OYDsERggQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBDoEnniaTwfU+l0qAAAAAElFTkSuQmCC"},"3749":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADsElEQVR4Ae3bXXKbMBhG4abTZXYxWUz3mQ4X8mBGGPQv4MkNmEj6pPMeC+y0v375QQABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQuC2Br9uurNHCfr7//YShv77/Xp7f5RcQwmh9XAe/rnV1CQiwTjNyvhf80vQo/HXfo7aR0l0uEeAD5nWAsWZ7oe7122sfG7vXNQLskN4Lcd18G2hOn/V4I85/jyg6e82cIM/0mXHdf2ac1JXmlBL8dseYYZ1uAZsUUgLddD18OaMAbgGr2FqGvyoz1SkBOsUx47t/WbpngIgA67Duvit4BogIELtUIsJaqNjYI68RIJF+rghbCY7G2bZPnObp5gQ4jeq94VGA763zXvWQgAB52bx6tRahtQQ+BbyizDtpHVDerM73sgOcZ3XYssVu0FowAhzGmt6gpgitBXALSM/3sEfr0A4nkNDADpAAK7Vp6U7QQyQ7QGqqCe17BJgwnWhTO0AUS/2LqbtBL3nsAPWzjo7YK9Bo8Q8XCfABzhN+RYCOKc+4C3gG6ChAKHX2eaCHMAQIqXQ+npVgmVZLEQjQOfhQLkWA0Gc51paBAGu6nc9zJagpAgE6h74tN1oCnwK2iVzodYk8YZkECCQeeiTAQ4MPy/YMEEgMPJZu5SWfDOwAA4OfoTQBZkihYA4l7/6lLAEK4NfqWhpiyTwIUEJvcN8a4hBgcIijy/vPoaMTyKhf450fytoBAomLHGuGvyyZABcJfplm7fCXMQmwULjAT4vwl2UT4ALht5wiAVrSvcDYBLhASMsUS/9esLdMAuyRmfB6Cwn8NXCCoFODrflAaAeYQICRUyDASPqZtVN3jE9lCPCJzgN+R4DBIdd8N+cshQA51G7UhwA3CjNnKQTIoXajPr4HGBhm7v2/5vcA/kHIQAFSS9cMPtQmQCAx2bFF2LElegaIUXnQNQIMCjv3/l97ugSoTbTSeL0EIUClwFoM00MCArRI7mDMHsEeTOH1awK8UMx50loWAsyZ+9usWkpAgDfUz3vhq+DOmZe8m1t8OWQH6CzAbOUIMFsinedDgM7AZytHgM6JtLiPlyzBQ2AJvcK+KQ+ErcQhQGGINbvHhGgVfM15GwsBBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQRKCfwHMZK3HoPW4VoAAAAASUVORK5CYII="},"3751":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABmElEQVR4Ae3SUQqDMAwAULvD7IQeYyfcZZR+ZFSJglN0zCeIbdq05MWu8xAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECNxHYHj2w32qPafSxznXTG9ZauRSfJptdqTAJT/AWgF+gjWdP1qbN7rO483KnO/P9ohtFyjbU47JyBpa3q8S8TqOm7JYrPnuE/gg7zvmu+xobM3OGt6e2q63cWMCBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECPykwAjNHK18Bpp+VAAAAAElFTkSuQmCC"},"3752":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAC7klEQVR4Ae3Z603DMBgFUEAswAQswf4TsAQTMALIiFSRmyZ+xdjl8IcWEvvLubeBwsODDwIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBCYWOBx4tmnH/3t5fWr5CLePz+a5dZsoZIL+a/nlAYfe7UoggLEqic+bxV8PGJNERQg1jzh+VnBr0ctLYECrBUbP+4RfDxybhGe4gU8byPwF+GXTO4OUKK2c84IwefcBZ53rsW3MgRGCD5j3Muh7gAXivIHI4afehdQgPLcf84cMfzlklJK4JfARavg88jhp16OAqRK3elxClAY7D28+sOlK0BhAWY4LaWkCjBDkifOqAAn4s6wtAIUppTyFqtw6a6n+UtgV+7bm60LlfKz+/ZKed/xh6A8r6uja8Jah3618O8XatYPSxztoQC35DO+nhvSUSjx1rnrx+fv7acAsVbl862w9gJI3W5r3dRz9/ZXgFTFAY4rLYECDBBeqxFyS7AXfpjJ28BWyXRa5yjQ3DEUIFfszo5XgAkDbXkXUIAJC9ByZAVoqTnhWgowYWgtR1aAlpod12r1e4ACdAyt91YpJVGA3qkMtp8CDBZI73EUoLd4p/1Sbv9hFAXoFMio2yjAqMl0msu/gztBt95m77+Cqbf/MJM7QOtkJltPASYL7GjcnFd/WEsBjkQn+n5u+AowUbjrUfd+/q+PS3nsDpCiNMExJa/+cFneBUwQ7nrErVd/afhhXXeAte7gj7fCrx3ZHaBWsNP5t8KvefWH0RWgU4A122yFXxv8Mo8CLBIDfj4z+AEv10gECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIE7kjgG7QBeYuSiHnhAAAAAElFTkSuQmCC"},"3754":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACsElEQVR4Ae3XbU6DQBAGYDTezMN4Jg/j2TT8INk2pWGBmdnKY2Kotvv1vMMunSY/BAgQIECAAAECBKIEPqev3/k3qn/9voCAIniBkKKnaBeIFtY/gVcQsBOMkdJb1TTaAviZvsvmUbX+UcYthVcE9WVQWgDz8hVBbRG81w5/O3pbDLfv+CtKYKgCmBepCKKiftxv6RHwLGwPho8DO/u/ZTvAs/DPXqT+1gU+1t+KeUfwMa57e03dAYS/N6a4dmnPAD3hO//jAr/vOaUAhH/PPs7foQXQE/xM4s7PL4ywAugJX/D5wS8jpn8LWAaer4JvNWpep34LaJco/Faj7nVZAdQt2citgAJoNS74uqwAeh4SL5hL2pJ9C0ijHnOgsAKYl9t7l3swzC+S0CNAoPmB9o4YugMsk+nZCRTNopZzDd0BcpZglCMCKTvAPMEtu4C7/0iU+9oOswMIf1+AR1sNUQDCPxrj/vblBSD8/eGd0TLlGWDt/Bf+GREe66N0B1grjGNL0rpHoLQAeibqszEC4UfAlrvcURAT7pZeh9gBthTJlsX4TL/AEAXQP20tzhIIPwLmiW69wx0FZ8W6vZ9hdgDhbw/tzE+m7ADLhJ/tBApgUcq9phbAsrS2EAS/qNRchzkCapZvVAVw8RpQAAogX8C5n28+5Ijtw+CQE7zApMqOAOFfoLoskQABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAv9D4A9h1FiQbrU1EgAAAABJRU5ErkJggg=="},"3758":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADxUlEQVR4Ae3aMW7cMBCFYTswfIX0OVBqHyG3MHybVClyltTpfYU0CSbGAPSYokiKK2qG/zZaSaS0/N6QqzV8d8cLAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAIF1BJ4fv/xdZ7RvI/202oD3xrtaEVAAexXB+XUEdPbrdoWRswKYlFcKX4Z+b8a//G5aAC9/fof3YQUolHxaDIVmrk+Fr/CedGzwuhKkx/VYz/Wv1IcCyKSRBp05/e6Q90KgAN7F+bbTUgDa3WshhC4ACfL1+0/NaHP7+enr5rmWEx6LIGwBpOGPCrimGLwVQfhfAWeGLwUihdfzFVJTXLdoE7YAapb+W4DqNb0UQcivAF3+z579Gr7d7n0t5Iplr4+9R+/+Q2/HK/ebPfutTS5g22bWfrivAMU+OvtnFtFZs1+KLtxXgBbAiBmlRdBSTNpH7t/ST9qfGbzcT16hCqA2fAmpJZw0VEHTvvZ4ek7et7xmhC+fL+QzQAk+F1qpvZzTwLXd1jVsO21f2s4KXj9TmBWgZvZrcD1BKZhuR1xrdvgylhArQE34GtyI8OVao66jn2vWNtyvgBykzDSdsbnzKx9zXwB7s1/C//bj1/9/944ya0cWrOsCqAlfsa4W/hW+/8XGbQGUwhdcBZbZXxO+tteCWWXr8iFwK3wborR73UnS9tlpHu60uwKw4ZcClAe/0uwv9b1l0rPumxuTq78DpOHXIKbt08GX+m71SfsffV+6/9Frt/Z3tQK0wG0F2XKNVkyP7d0+BPZgE/5HtXAFIDPfzn4J/mj4Pf1zfXLHPsZy3pFwBWDpRoDrNXRr7+F5P3QBzAwsd+/csdnFE6oA0qW/F7u33+wge+/v6ldAaZAa/ugAe66X65M7VhrPWedCrQCj0XpC6+kz+nO3XC/MCnAF+Ct8hpbwpW2YAmgd+Fntr14Urv4UfFZopfvos4Ztc/Wg7efVfZ4BVGLRLQUwIHivs1+GTgEcLADP4VMAB8OP0J2HwIYU7QOg99nPCtAQvm0aIXwKwKa64D4PgQuGng6ZAkg1Kt9HWf4rh0szBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBDICPwDz0kLbbOkvDIAAAAASUVORK5CYII="},"3760":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABXUlEQVR4Ae3S0QnAMAgFwGSbrNQJs1K3SSawiLS0lPNXn8hha4oAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBCoCPRK6NbMOFa475zv3xce94/Gd4GvHiNj73kySmYIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIEHhEYAOZvgYDlMmeuAAAAABJRU5ErkJggg=="},"3771":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAC+UlEQVR4Ae3b223bMAAF0DjoLP3OPJmjA3SAjFF0nn5nGad0IEEyKJsUxYfhk5/YikRa515RdpC8vPgiQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAgZ0C55+/zjsPrX7Ya/UZTHARGLkEImogEAowYgmsAA3CX04xWgkUYJnOEz5WgA6hj7QKnDqc/9NNef795/tTwN9/q3M/fX5097cCrCJp+2SElUAB2mY+3GwKUDmS+Sq/Wv6naeefTxsaf1eAFuAb4U9T9yyBAkwpVPh+efP3/lZh5OOGVIDjLFcj5V7VufuvJit4ogAFeFuHXsKcrvzl8h+2Tdu3Dm68XQFqgE8hL8NPmKfHKvAj4XXZJVFgFWBm+IlTHL6bFeBw0v8DxsKfVoUw3/JxjfkzxlSADKxbuz7CO/7Y61eAmErmtvl3/VvHZVzxq9vI1ngHbleAAzGjS/+R41cYSwEKUecrNnbfD2NvXf1b2wtfT+7hCpArFtt/K/zYvoNtU4CagQxyld86RQW4pVPyswcIP5yeAhSEPN//C8bofagC9E6g8/wK0DmA6+lb/52gAlwn0Or5IJ8cFKBV4IPOowA1gnmQTwDh1BWgRgF2jtn6/q8AO4MqPmyQ+78CFCe5Y4CBwleAHfnVOqTH8q8ANdK89QZwsKs/nH73f06skUHLMaO/Dr4uwZ3ge139wckfhdZoy53Al1P2DD+8Dh8Dl2k84WO3gANCj94GEsbtffWHl6gACUGl7JJbghHCV4CUZDP2SSnBKMFnnJZd9wiEMqQUYs/YjiFAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgT6CHwBtdl3viELVCQAAAAASUVORK5CYII="},"3772":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABNklEQVR4Ae3QMQEAAADCoPVPbQwfiEBhwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwb+AwMAjwABWBXfzAAAAABJRU5ErkJggg=="},"3775":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3776":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADe0lEQVR4Ae3ay3KbMBgG0KbTx+qmT95N3yuNFpohNqALAoR0MtOxY11A5/uRXZwfP/wQIECAAAECBAgQIECAAAECBAgQmFXg7+fvz/BvhvV/zLDI3DUuQ//z8a/KJs5ROz73XFv1+9VqoqfPE4OrXcfR8bXHPTru59EJRhxfevU+NfyQ3fQ7QG14e+NKC+jOi2jqHWAvxL1QasftzXlX29QFUIOeCv9JV39Y/7QFsBXkXoBbY2oKqZcxUxZATZA1Y3oJee88piyAPZC1ttzw93aPtXl7eG26AsgNs4dwrjiHYQugVdCt5rkizJpjDFsAaxilYZb2Xx7zyNjlPGc/H/JGUAv80jni+3/puLMDTs0/1Q6Qwjja/rTww3qHK4CtELZeXwu9pG8c/zom7gixvdfH4QqgV+hez2voAni9KlMh1F61Ydxy7PJ56ph3tw/5IfAu1CcFH42G3gHiInMenxhezrpSfar+7Ck16Z3ta9v+MtzX9tgWX3/9PbWW2D/Vr9f26d4Cnh5Y60LyFvAlGq/+JW4olFSxpNqX8/X6fLi3gAC9DDQV0rJvGJvqH/qM9DP0DjBbmDWFOeQOkAvxevWHcbMVzdA7QG4h6De5QNgJ1naDyVksnwABAgQIECBAgAABAgQIECBAgAABAgTGEJj628BeI8z5XqLVt5YKoIMqyAl87zSPFMN0fxO4B3l129HgW5yvHaCFYsUcrcI/cvWH0/YHIRXh9TLkaPgKoJckK86jRfgKoAK+hyGtwlcAPaRZeA4tw1cAhfh3d28dvgK4O9GC458RvgIoCODOrmeFH9bkPsCdyX4de+t+wJmh37xkhydAgAABAgQIECAwkUD4xL/1qf8uBt8GXiTfW/Bx2e4DRIkTH9fCz/l//nJcTv+aJSiAGrWCMcsQC4a9dT2rALwFvFHP9YICmCvvt9UqgDeS/l44a/sPK1UA/eX97YzODF8BfKOe8xc7QMe5n3312wEmD18BdFoAV1z5celuBEWJEx9zbwZdGXxcrgKIEic/7hXBHcGfvFzTEyBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIbAn8Bw/a1TamrlIIAAAAAElFTkSuQmCC"},"3779":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACO0lEQVR4Ae3YbU6DQBAGYGq8j/c/hieqmSZLKCm6dD9rn/5ZqCAzzztC7bJ4ESBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIvKTA5SWrfqOir9/L9Wy7l68lO9fsA88W4fjzAs+EnXuVo6EwALmCjY5rGfq+5EdDYAD2So33ewaeWnkU/PqztGFtK9A7+N9C33bqDrDVqLzdO/QoPzf41KoBSBKV1hGhR+lng0/tGoAkUbiOCj7Kfjb827mFfb/16SNDv4V34v/9o6DcAY5k/nh/ZPglf/H7tj72b9ifW6Bm+NGpAZg777vqaodvAO54595pEb4BmDvztbpW4ccFPter2JhOoGXwqVmfAZLEZGuP8KNlAzBZ8FFOr/DjWgYgFCZ69Qw/2vZFUEH4tb8M6h1+tO5DYMEA1Dp1RPCpdo+AJDFoHRl+tOwRUBh8yWNgdPgGoDD87em5gzBD6Nu63QG2GhW3twMxW+gV2/SrCBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAg8F8FfgA99iwRtaW8IAAAAABJRU5ErkJggg=="},"3784":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3786":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAB/klEQVR4Ae3YTW7CMBAGUKh6J/Y9Rw/DYThH95yKykhGEWKMvagKM49NwPkh875xCNntvAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAIFXEdi/yon8x3lcjqfLo+/dH7/LuHw+Asg8FoWeueZRbSU6fSX0SrO/NcbHqDsyrLuGf/jJUMqf1JC6AVbDrzb7W0elvAdYueT3aVUx/FZ7uiuA8HtLzy1TNYDw50LfbpXmJ2A1/KqX/G347X2aBrgvLPocBX/fQNF20XHfdTzlc4BtmKMgt9tFAY72j/Z5p/GUDfAsgJng2zGyh3+t8RlWlvW30PtDofPXsLQK4TeAVP8CokRv4UcbFB5PfxO4Gn6Vmd97vsQ9wGwTVAu/N4ElAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgMCfwC0I0RlNwThoAAAAAAElFTkSuQmCC"},"3787":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABnUlEQVR4Ae3UwQ2EIBQFQPWwhdiosVEL2ctuvBmD8RtIQB2PCATmPe06DwECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAQJZAn7U6c/H0GX9nW8zfpeoZz8539/fVcCPhH+EqxZHM9fFqBViPqgTXAyu9omoBIpdJlcQfICIXmzPEprUzS/hls2j6D7D/+oVfNvx1t2YLIPzyYad2bLIA2/B99anYXjC2LcELruuKBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAg8VuAP+hwgCuaCKn8AAAAASUVORK5CYII="},"3792":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADzklEQVR4Ae3bTW7TQBQA4BRxAHoJdvxskdhwBBArzgGngHN0heAIbJDYQtlxiXKDoqny0rHj3/E4SctXKbI9Hj+Pv/c8btJ0s/FDgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgMBEgUeXH67Ta2J33U5Y4OHcseWJ/3b9srMIXp19P5sTty9OxEjx8vP+ffpxVvyIY7kvMBsyT0QK9/XJj/2o25axQhhLfArz+veLvfgKYI+kuGH2DNA+U0pQXxGkBHcVwVjiu5LePq/tOgIPaoQZSlie7LSeb3edeyhWV39tywQWzwBx+khc12zQl/Q4JmJYHl6gygyQD3tKUlOfKf3yuNbXEaheAGmYfcmV+HWSuCRqtUdAexAp2elx0FcM7f62jyOwygwQlyL5IXG6y1UL4HQv28hC4M4VgA+BInV1lrMLQALqwJ9KlNkFcCoDN446AgqgjuOdjbKoAK6+PNukl5+7K7CoAKZctiKZonS8PsUFkN/5V287vxYwe3bIYx6P5P86c3EBjDG1i6K9Hcen9pvX9lGiCELmMMtVCuAm2e+e317Bxc/b9WxtVxRZ3/M3v7IeVtcWKCqAXeKy0e219SQ9Dtnrn3aMHBPHWtYTKCqApadvJD+7+5fGdfx8geV/Dczu2pTY88/Z1wyzfTG0RvJTY0ef6Gu5vkB5AfQkbi/B61+DMywQOMojoG+8jdmjr5P2qgIHLYCh2UHyq+Z1crCiAjhmstr/lzD5SnXsFCgqgM5ICxqPWVALhn0vDi0qgPSdgMlJG3mbNznOveA+vYsoKoB0GUVFkIphpCDGiHwhZUxo3v7sTfu8A6N3eiYP/XIX/bqWJXe/AuiSLG9bXADp1NeP39/+OTDu8J7PCXZD3fab+tm/xO/kqq6UfxC0HUYj+UNDaxfGtkCuLjbNTw+3MSR8CLPevsUF0BhKJLnROLCR+mczhaQPWK20q24BpGS2knoz7pHCkPiVsjshbPG7gN7YcUenpEfioy0/KPbFMt9n/WAC9Qugb+ipCGKG6Ouj/eACiwvg7M+n/ncSXXd+FEHsi+XBL90Jk8A/5xvPqAtazoIAAAAASUVORK5CYII="},"3793":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3795":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABj0lEQVR4Ae3SMQqAMAwAQF18iB8VP+pDXJQOBSlCLVqRei6CpmlySdd5CBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAg8KjANIxbScIQX3qmJP+XYvsvFVOjluMg53XJ9hvjr8TWqPftnFmQtwuqcV8casydDjf3P55r8f2LBQiDS4d8Nsx0Mc5ifGtEICzElaVopF1tECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQI3BXYAThcHEKsJNrwAAAAAElFTkSuQmCC"},"3797":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACFUlEQVR4Ae3WQVLDMAwF0MJwAe7AivufhRV36BHKeOEZL0xTWUqmgddNQqhV+X0l7eXiRYAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIDA+QReztfy3+346+P9Ft3d5/c1lWFqcbTZ//7+lYAjZivDYAAiwoH37h322MpK8H29AegSRccjg28tZ8Jv6w1AUyh6nS38tm0DcMLws3f9uOW38Q/ncYGj7/qxw63PfmRQPAFG0YXzrRAWSu6y5LdhMAAJ7srwZwFV1m/bnH2Gr4DEAGSWzsLI1Otro3U9Abpc8Lhyd0bCebR+pOZsi6+zi67VC2SDmnVUUdNXwEy28FpFSL2dylq9pgHoEsXHTFizx3+m3r2t+Q1wT2fjf3sFNdbdK/i+NQPQJZ7keGT4T7JlbYwC4wCM150TIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAjsKPADvyZR7H9jAT0AAAAASUVORK5CYII="},"3798":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACFklEQVR4Ae3YQW6DMBAFUFr1Zj1Mz9TD9GytvLAUIcYMjhRs92VjhRjwvPmQkG3zIkCAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBO4UeLvz5Cud+3P7+r2znp/tu6uXXTvdWeho57678ZFHNhACEAkmt48agLr8syAIQJXqGEdvfi2pFYL3Osm4rkArqAKwbt9TlQlAimn+SdFd4GP+0uavoPUdfVZd1Niz/ernAlAlXjQ+0+yjJdbj9QbBU8CR6sVtLfzaoIuH7J5+dS0C0E097o5RCI7C6EfguH3sXtlRo6ODCUAk80+2C8Cijc7eBQRg0QBkyxKArNTk86I7ggBM3tho+dGTwH6+AOxFFnwfXf2lVAFYsOHZq7+U7o+gxQLw2PzWlV/LFoAqMfn42PhSSqb5ZZ4AFIVJX/umlzKyjZ+0ZMsmQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgMLDAHzvtMX+9hChxAAAAAElFTkSuQmCC"},"3801":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADKUlEQVR4Ae3aQW7UMBQG4CkngIuw4iYchFX37LviIJyEbuAAXAFuMChIHkVpZuLnOLYjfZVQM4Njv3zvj9MpXC6+CBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAgWoC15+X6/Rna8LccVvz+PtjBN4dM61ZzyIgAGfp1EF1FgUgZ+tf1ltyznIOr+sLPJVMOW/mh6fny9+PL6vzvP/1/OZnhHtjS+pwzn6B1cZtTZvT2LUxaV4hSBL9v4cfAfcae+/9tUuMjF0733v1BMIByFlag3OUxhgTCoDGjtG0mlWEAlBzYXONISAAY/ShWxXVA5DzmPApoFu/3yxcNQA5zX9TgTe6CmT9HqCksV8+fb9d2LfXz7djd/+NYoiDzR1gT/NT4+dhGOKqFXET2AzAbWTmwZ/ry2VqfGp++i4EmYCNhz18BETv/tTkrz9+/7+M6d8Jll8eAUuRvq+r7QCp+emO73tZVs8VqBaA+YLTnb92909jorvKfF7H9QWqBSBy5wtB/UaWzvgwAJ7XpaznOe9hAEouI/0sUHKuc9oLPPwUMJUT3a7nAbj3WLCztG/0vRU3A1ASgrXFNH1Npf97WY8AzevfqKMqyNoB0uLRx0E6T4CSxHjfs3aA8cpWUS2BUADcybXYx5kn9AiYlx15HAjOXG6s49AOMC9dU+ca5z0uDkDkkiO7RWReY/cLNAnA/jLNcJSAABwle5J5BeAkjTqqTAE4SvYk8wrASRp1VJkCcJTsSeZtFgAfBcdMxK4A+GXQmE2NVLUrAJGFjB1TYFcAbOtjNjVS1a4ARBYydkwBARizL82qahoAj4xmfc1eqGkAsqsysJlAk/8QsrwaHx+XIv1e2wH62Q+xsgAM0YZ+RfwDSQqHFw1NL7UAAAAASUVORK5CYII="},"3803":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADeklEQVR4Ae3c7W3bMBQF0LToAJmk23WKbtdJukEKFiBAEJJMkY8SbZ/+sezogzz3hjISpx8f/hEgQIAAAQIECBAgQIAAAQIECBAgQIDAiwt8e/H5LTG9zz+/vvJA/v78vZT59zwwj3MEyvDnXGHsrAow5nd49Nnwz+5/ePHGLy61HDWOefnd9oI8Wv7LY472i568FSBYtAyy9dTlMVeGn8b3o3WQ9jsWKEPc2nMr2EfHbJ0n+jUrQLToxvm2wt/Y7ZaXrACD7D3fxXvH3FEUbwIHCrAXZHnKOtS9Y+r9ynPM3HYL6NTdC7I8XR1qyzHl8VdsK0CHck+QR8fURekYUvch3gN007UdeBR8OsOd4afrew+QFE78exToiVP93/XuAlgBziYWtP/dwedpeA+QJd700S3gRPBRy/8q3/1p6laAEwWI2HWl8NN8rACdqfasBquFrwCd4ZeHtRZhxfDTPNwCyjQ7tlcNtnUqbgGtUg/221sJVi+IAjwI9syX6xKsHv6Zudm3USCVoC5C46F2I0CAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAwKCAzwQOAvYc3vuRsRmfMVSAngQHjukNv75kVBkUoJad+Dwq/HqII2VQgFpz0vNZ4efh9pbAXwZlwSd+7A0/Tdl/EPGkwY+EXk7ZLaDUmLQdvfxHhZ+mqwCTQq9PO1KCyMDrcXkPUIu82XMrwEWBj6wAeYgzVgIFyLoXPK5YAreAC4KPvEREicrxWAFKjQu2IwOMuCUowAWh711itAwKsCf7RK/3liAi/MRkBVioLEdliAp8oekaCgECBAgQIECAAAECBAgQIECAAAECBAgQeBmB9DP+o5/z3zlRvwyarH8U/Aq/4FGAiQU4Cr++7F1lUIA6iaDnZ8LfuuRVhVCALf2A10YLkIcwuwgKkKWDH6MKUA5rRhl8KrgUfsNtfxy6eOgzvuvLKbsFlBrB2z23gdmB11NUgFok+HlPCdIQriqCAgQHvnW6lUugAFuJBb/WW4A8jJmrgQJk5QseR4owqwQKcEHw9SV6iqAAteILPG8pwqzgX4DPFAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAi8gcA/7IjOWAdKi3oAAAAASUVORK5CYII="},"3807":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACAUlEQVR4Ae3YWwrCMBAFUHUnbk9cjrg9l6L0o5CPVJTMTCMef5TSJtNzr/g4HDwIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIENhH4LjPtv+96+18eW4JXB/30kxKN9u66X84/i703v1XFUEBevqBx74Nvt26ogQK0IoHvx4Jfx0luwQKsEoHP0eEv46UWYLTuonnOIHI8OOm6q+kAH2XqY5mFkoBpoq6fhgFqDefakcFmCqO+mEUoN58qh0VYKo46odRgATzzN/t0eP6IyhatFnvk59vbVnend+e12wx/FIBhgljF+iVICv8ZXIfAbH5/dxqCjB5ZJnv/uXWFWDyAmSPpwDZwgPrZ7/7l9F8CRwIKPrS9gtgRfgKEJ3gwHp7hD8wrksjBZbw2wJErm0tAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAoFbgBVqdNkCSHabBAAAAAElFTkSuQmCC"},"3808":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAEOUlEQVR4Ae2aUXLcIBBEN6kcJsfIEfKbE+bXR/Axchun2lttjyVYIQmkFTx9WCyCgXndIHbLtxsXBCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACpQS+lTakXWMCP/+8zUb497e5Pj9mg1JxPAGL//vX59gvr5/lhiUM0BBuUWiJH4Uv6lSv0fd6oYi0msDJ4mu+GGC1an11wAB96bk6m+anzNUzGqWDD34xX58FfAA84FsABogCHFW2+BZc41r01BwaGoFvASngLess/nQMmUEmiKZQm0fG0POdF2eAnQBXdbf4U5FjkKngaut+sV2lMgaoBHIxjEV8JH4uSEMT8ArIQa9VnxJ+uso1VqouzkEmeLm93SqfB8YygMWoDDHq9FH2WCUrPoq/1F5xK85/LANYncoQHfb9vlX4L0EyH2wO7QS6ohE8bqzLhInVYxrA2+kUYiRTWjZ4t7dI/rz2rt1gKYaf2whrxwjtxzSAANSC6DgB6u5iiQm+5PB6H3Ll6lensX4I0mptIdgdf/5vFNTve4vlObk+Rimdq/o6XuxfUB7na+B0qy6AU6VJSthU4FKxp313iK9QY7wCLP5WyFPopZ8lzpox17S1sTaufKcwhgGc7VF3izMV1PV75+E4O8XXNPo3gFf/XuhL/S2K2k2Ff9RXIvo0X9LP41QQX9Pq/xBoA5TAfSRU7pkF0fPcGLGN2qXEezTP2D/VVzE3Xv3vABvBFHWTMDnRHSCK57rU3cJ6N4ht/CzWVSr3bQCvqkqwZmGWxJ91KKhoKHZq9L4NkMr4qLrcyj9Y4KV0+zVA69WfI5sTPtf+5Pp+DXAGWIsfXw2uO2M+BWP2aYCzVn8UPgX/ybZ/TXGcn4JTghxZ94Tij2OApZXZygje/p9U/DEMcJb4rUxVOS6vgMpAP8JdYPVrrn0b4KzVfxHx+zfAx3I8sHAh8TFAbV9cTHyl3+fvALWFXYpn4dXuiU/8qTT6PgOkMq5dd2HxhaLf/wfwr4GtDoIXF97rgB3AJNbcOxFfKfd7BtC72LvAGnFzbaPoanOxd30urX5fAcrYBtjzGpgKr7idiK9U+jaAMtxqgs6FFxpd/RtAWdoEKi/tBoMILxS6xjPAPe+5EQYT3hjGMICzjTuB63L3jt7zuRRVP5YBlPGSCQYRXih0jWeAe95zIwwmvDFwhwAEIAABCEAAAhCAAAQgAAEIQAACEBiEwH8wtuphhSRvnQAAAABJRU5ErkJggg=="},"3810":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADf0lEQVR4Ae3ay5HTQBQFUEMRDms2ZEESTAiEQAhDEmQxG9bkA5bLmlJpZKtb/dTd8hyqKMuy1J/zrj4e+XTyjwABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIEGgm8PT777/h/ziA+ftxvdcHFZgWf5zi0rrxM69tBT5Gdr9U6GHd85+XyG60FSgQGoA34/rx63IpePry9XS6Lr/ZxoqmAtkBWDrKLzOYFniyPBz9zgBNa3y38093P838UKEzwTrYPPsMcBnz5AhffN/BxAwhTSAvANPCT5fnff38/mG+yvs+BfICkDOHewHJace2uwpkB2Dzdd5ZYddCbm08OwBbO7JfnwLNAjB8nbz5lbJPq4cc1T4BSLj+P3/7fLlRFIK2uYoJQMH1ffM9RVu3h+k9JgBbOM5nidfiJ5wxtnRhn3WBsgBEFi6yrfV52+IqkBeAglM98T4Fyp8FTI7cy1O/2TxfT/Oz9d72IZAfgOEsMCn6OI2h+Io9ahznNe8ScGdeq8Wfhma6fKdNH+0vsC0A7gX2r0ylHrYFYBjc1hA4+iuVNq2b7QFIaz99q62BSu/BlgsCZc/to45mxV8oTZ1V/ZwB6sxXLzOB9gFw9M9KUvdt2SVgGOvWy4DC1630jd7y/xB0o6Hk1QqfTFVjw3oBUPga9czuo/weQGGz0XvaoTwAw2yEoKeaZo2l/CZw2t3aDaGgTLW6WI45A5yn4rd9XdQzexBhARh6Xvo9QPaI7FBVIDQAq4+Eq05NZykCoQFI6dA2fQkIQF/1qD4aAahO3leHdQOw9jWxL5t3MZq6AXgXpMeapAAcq17hoxWAcNJjNSgAx6pX+GgFIJz0WA0KwLHqFT7a0AAkPQvwVTC8iCUNhgXAc4CSMrTbNywA7aag5xKBuADk/NjDZaCkZqH7xgXgOqyk+4DQKWisRCA0AO4DSkrRZt/QALSZgl5LBNoFwH1ASd3C9t0lAO4Dwuqze0OxAcj5JjBMzVlg9wKvdRAbgHNvbgTXyPv6/D8zw5QBy70a+wAAAABJRU5ErkJggg=="},"3811":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3812":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACu0lEQVR4Ae3Zy26DMBAF0KTqZ3XTL++m/5XKi5EsJIIBPyg+3UDLw+NzB5Ooj4cfAgQIECBAgAABAgQIECBAgAABAgQIELi5wPPm8yue3s/r61V68vfz9zZut5lIaXjL8/YEv7z23e//pUmmaIAU8logrRogb461sfNzRu1/jBq497g9gl6b08ix12qKv0/RAPEEjgoixg/0K22naIAcfFQT5DXEfqpldD2fUYxtP4Fl6PH7iJViuhUgxRzgPSJfhvpu7HfHWtU67QrQG7v3eKUNM8XXwIQxIoD09B8Zd7lqlIZ55LxpGmBUExwJJa7p0QhTfgYIYNvHQwNcuAuOvD72TkcD7BW72fk+A2SB7nnn9ng6o7Q9dcU1pdtpvwYmoDOwy2t7NkRpuCXnTbUClICcPadVIywb7mydcb0GCInK29qNoAEqB9TrdjUboUUT+BbQuBNahFazZK+Ampob96qxGtRuKCvARmh3P6wBOiZc++mtUbpXQA3Fnfc4+ipo0UAaYGd4tU7f2wQtwk9z8QqolWjD+7QKP5VsBWgY3NatS1aBluGn+qwAWykNPN46/DQ1K8DAgNPQa6tACn/tWJRco0E0QGgO2m6FvFXW2SaY+t/BW7hXPX429HxeVoBcY9B+ySpQM/R8mlaAXONi+61Cz6epAXKNi+z3CP4iU1UGAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIEriTwByWvijOSK+T0AAAAAElFTkSuQmCC"},"3813":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABwUlEQVR4Ae3WwQ2CMBgFYHQep3EKZtCzzsAUTuM+mh6aNECAG0nfxwUDJs3/vUfTYXARIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAwMkCl5PXP2X58fP91YWn+y3SoM4fM3wbeh2+3pNLEFGArfDTS9B9AY6En1yCax0+6T49Xknjbs7a9Q6w9vW34Y/v5wIn7TwQtQO04S+SD30QVYC9jNO+/uLRdQHmgbZbfvt7rxg9v+/6DFCCWzsHrAU6L8vaf3p81n0BSmh7JUgNv9hEFGCrBMnhFxcXAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIDAQYE/F74rP8mMtXEAAAAASUVORK5CYII="},"3814":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACKUlEQVR4Ae3WwU3EMBAF0IBogApoAuqiAM4UQF3QBBVQAmhYfa1lHHGJMCu/SCHOZOJ13tgW2+YgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIDAIQL3t3efdR7S2QV2cnOBYz5kyCsXvQW8bm9WaLcr/vXx+fuT3z7er1b49tE3LvHh/WpP4R9enraVi18TYtoE6IuS2XlUQfb6V/xIn65TJ0CKUUOp1fjbsTc5RsUe9Z2YlX+Wnvo/QFv0FKeuadcw23YVenQmL7l1rb5H/bexM8O6rWk7QJFn5aZwfXH6eO7r3TY38cT6+8pvj72dpM1ZpT11B0gh+sIVforYtyu3znqenLzf5+Z5xeuo38tvniL+Tt0BWv7sBm2sL2AKvRevd+tZ8tKXokfi5/XfTIB+aKMJ0efs3Sv4now4AQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECPyxwBddjIa+c3QpjAAAAABJRU5ErkJggg=="},"3816":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAC+UlEQVR4Ae3b223bMAAF0DjoLP3OPJmjA3SAjFF0nn5nGad0IEEyKJsUxYfhk5/YikRa515RdpC8vPgiQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAgZ0C55+/zjsPrX7Ya/UZTHARGLkEImogEAowYgmsAA3CX04xWgkUYJnOEz5WgA6hj7QKnDqc/9NNef795/tTwN9/q3M/fX5097cCrCJp+2SElUAB2mY+3GwKUDmS+Sq/Wv6naeefTxsaf1eAFuAb4U9T9yyBAkwpVPh+efP3/lZh5OOGVIDjLFcj5V7VufuvJit4ogAFeFuHXsKcrvzl8h+2Tdu3Dm68XQFqgE8hL8NPmKfHKvAj4XXZJVFgFWBm+IlTHL6bFeBw0v8DxsKfVoUw3/JxjfkzxlSADKxbuz7CO/7Y61eAmErmtvl3/VvHZVzxq9vI1ngHbleAAzGjS/+R41cYSwEKUecrNnbfD2NvXf1b2wtfT+7hCpArFtt/K/zYvoNtU4CagQxyld86RQW4pVPyswcIP5yeAhSEPN//C8bofagC9E6g8/wK0DmA6+lb/52gAlwn0Or5IJ8cFKBV4IPOowA1gnmQTwDh1BWgRgF2jtn6/q8AO4MqPmyQ+78CFCe5Y4CBwleAHfnVOqTH8q8ANdK89QZwsKs/nH73f06skUHLMaO/Dr4uwZ3ge139wckfhdZoy53Al1P2DD+8Dh8Dl2k84WO3gANCj94GEsbtffWHl6gACUGl7JJbghHCV4CUZDP2SSnBKMFnnJZd9wiEMqQUYs/YjiFAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgT6CHwBtdl3viELVCQAAAAASUVORK5CYII="},"3817":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAD5ElEQVR4Ae2ZS7LTMBAAHxQXYMEN2MCpOBqngg03YMERoIaqqaj0/GSPrflYaW+UxLY00z2SleTlhQMCEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIDArQn8+Pzxr3cC770HoP9zBCLkn4uMu9wJiPyoAmAFcNdpGyBKvEZFASiJAm20fEn5Q4G8nz6EDPEKnQJQEgltpnhN952+oI0hcFT6119/QtywAgR4Pyo9IJRXQ1AAr5Bc/6Cy8D47CqAnYnx/J9lbqVEAW1Q2PvMQ/eXbp/8j/fz+e2PEmI8ogA3OHrL7YSrIl5gogMZMhHgZrop8ieWpCyBKuIDWo5J8ienpCiBDeis/83mvcbTt0xRApngBrjO/hV/h9dIFkC1dBav8arNf4lv230Dka/mN2+VWAMSPhfdnQ/5w6Aed/b6KdM1r1pIf8YfQrVeAVcVrIUW0tyyAquJFWMWN3qiQbrcJrCpfxJ+Vr4+MkSivc7faA1STP0OKyB8Vjvc+4BaPgBXFzyieGX2UfwQgf4bmt/souwIg/m1pM8+UWwFEPPIfir1ZlCuAR+q5r2Rzlrk7j8q+TAFUmvkqfrQ7jxIk43iuAiX2AJ4JWkRVE2+J/ey16SsA8o+p8+KUWgBeSR1D+rjqGWe+Zp/2S2AF+dniZXzrPmP2L4MpKwDydf7Z29nswjeBZxLYq3prn9kz367d747QR8CeqD3Rexj2+pf7q8g/s/y3+V9lpX2FrQBbcmYloclof1tjyTVV5Gu8V1rJUfO90k9IAfRCZgRuTXol+dbcR9e7PwKy5LfjVpN/dflvhV6dTK7fAloJEvTVYNvEra+tX7es/Wdd3zO2xuH2CGgDyxQvQCrJnzn7rbK3rnddAUR8tvytpFf7rJ1s1tzc9wDWgGZdfwXKrBj6frxn/5nJ5vYI6JOPfD+SvwdpdG9kDlFjLbkC9BL3pPew+/v782fee89+jcmaq+seQIPKbK1AJNYz94xyFPlVj+UKoJ29V0ReuXdLdqVvIm18yxWAJjdD4Iw+JJ6q8iW2JfcAktjMo11VZvbr0Ze1aJddATzgrtgnBXDAqnVWHeiyzCUUQBkVOYH8A0QDIvH/ewFjAAAAAElFTkSuQmCC"},"3819":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADbklEQVR4Ae3ZMW7bMBgGULno0j1nyDFyg25BjtEDFB2DHqBzT1Bk69I5N+jqExRo94yu6ZoGbVGyHPOPHfcZSCRTFkU+fqIku+u8CBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIDA/yUwq3V3MX9Y1Mpz2ez6trpf3p6WW3V8+1hu6maf5nv339rBmzCB6kCkwfvz+Nhd3dwcfeAUlsX9dTVQgnA079EVvDm6hpEKxgY/7TYUjJEqbWosEBqAKW0VgilKcZ8JDcDiZ1ed+ne7IwS7Ii/3Pi4AT7e9Xqyu+Xefe+UKTicwGoB0I7h6VQZzUpO/X68+lgZ+3w2fWWCSaPMPva3VmG7efn/9MGn6ru2/KlsPfrc84xd30y4Fg3XZECYwOANsHgGfe/anqT79HfAyCxyA1eijgwHY+rInnc07X+aMHj+FZvm3Vcd6h1rZaF02hgpULwH5iKtZ4OlLfttfpoF+99AvX5ekp4BywNMZ7iwf5DrJhtEApMErB2zyt4Npxkiv93Nf9vyTONv/g5eAoRZvngzyJaG4R0iBKc/4LgdhqDLlJxcYDUB59qeWXv36sfl9YPVYtx7g3sAf0a3dYx5RlV0nCIxeAqr75zM/b1yGYHG/vNb7hS+LvKpl9dfA3INTnY3ClEcgfjl6CTAQ8QNw6iOMBuDUjXP8eIGzC4BZJ37QyyPsDYABKbkub31vAC6vy3pUCkwKgFmgJLus9dHHwN2uvtRjocDtyse9nzQD5MMbmCxxOcuDZoCy25GzgaCV0rHrzw5A2ayIMAhBKRy33iQAZfNahUEAStW49YPuAeKa0a+5VZD6NSspBc42AGUjrccJNA+AqTtusCJqbh6Alo10GWipWa8rJABmgTr2OZaGBKBlR80CLTX7dYUFwCzQxz7HkrAAnGNntakv8CoC4DLQH7hWJX8BVvecfzEnks8AAAAASUVORK5CYII="},"3820":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3822":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABmklEQVR4Ae3VSwqDMBQF0ES6FqeuxB057I66GzdjUSM4yKC1VDQ5giBBfY9z8wnBRYAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQOBsgenZTvN9dt2r1YtXa+if/SyB9+Na4tVmS8VhrMqkySoUNvjNaq9tVyh+AhwJ9Mg3d10zj7s2/knfuSBjF9IWn46C3Y+292s6Boo+77ZA54xrCnU3pz0SIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAj8IvAGLTokVnfXYMsAAAAASUVORK5CYII="},"3823":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACGElEQVR4Ae3YUU7CQBAG4GKMB/ECHtF4RC/gQXzB1GbCYka6BRLa6ccLpdlddr5/2gaGwYsAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBC4VeBw6wJrmP/+8nrs3cfH91eJmnvrnRu3WYwloWcIGmFS2WQD/Bf+GOrxc0jvBoe34bfWdq4mGCaU7ApZ47k2vNhfFmLWBNEAMS/WyubHmD28b+IOEGFFIHOh9TTAuFasO7defG/F9+e1FRWhZPu6d1Djepe+L9tDtXOraYBLQdw7+Goh3lLPJh4BSwvsfQQsXbfi+KeKRampX6BcA2RXfz/H/kaWa4Aswr8/AbMxez23iwbYa7g9dZdqALf/nsjPx5RqgPPSpk9u/5nK6VyZBoirvw28PT6V7KgVWM0fQe2mrjkW9jVq5hAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQKPEPgBplxBg6r8hZoAAAAASUVORK5CYII="},"3824":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABNklEQVR4Ae3QMQEAAADCoPVPbQwfiEBhwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwb+AwMAjwABWBXfzAAAAABJRU5ErkJggg=="},"3825":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABNklEQVR4Ae3QMQEAAADCoPVPbQwfiEBhwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwYMGDBgwIABAwb+AwMAjwABWBXfzAAAAABJRU5ErkJggg=="},"3826":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAClklEQVR4Ae3c7VGDMBgAYPQcxpXcwBn0t87gBq7kNnrlSC9NE2hpbd+0j38IgZTkefMBd+Aw+CNAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgACBKws8XPn6h1/++eV3e/LPdz/13lY6ZuIxZrWKWuXBLw7ZPU0g5kg6JOBmgdMiP5XuYwY4S1P9SE0gZgcwumux+pe8mEtAamplKXj9fB+Pfr19DIOOkqRWb59Wl7xwwRT4C1/25i8XcwlI7NMIF/wEcv5t7A7QaK/pvwGzIruLDjAGfEXjFFkWiN8Bihs9o385qMecEb8DZK0xE2QYd5fcPBJWHgvvzkGDCRAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECMwJxP4wZK7mUY+Vby0V7zRGq3Y3H4ZEg9urzxT4/BuGHt5hNAPsRXJFRiX46Veiv8Xc1VvBCTXUdib4oerZqIwloAGzmF2u9ZUCPSwBZoBK4Bazjgl+8JtAHWAx2tkJm8A3gl8d7cGDv2mZDpDF99Rk6gTRb/zydnoKyDVa6WnUp0e8FOjW6T394wozQDOKuwdS8HdzK3sdTPt5rXWAXKOWbqz5tVN7Gvmp/jpAkpjZlqO/3B+LdjbyU3PdAySJ1nZu/e806HlTdYBco5Uul4EbCHyrqfIJECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgSuJPAH0n1deLlIs0IAAAAASUVORK5CYII="},"3829":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAFlElEQVR4Ae2cTZLTMBCFZyiOwIITzFnYcCOW3Gg2XIMtJ2DBHQIdqlVtR4r/JPXfywIrsiOrv/e6JYfUvLzgBQIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIgAAIg4JjAq+O5d5/67fvb7cigr99+uefnPoAjgtWuPSp6bQzq82qGtAboJbw0hEcTpDTACPHZCN5MkMoAI4VnA/DRixHSGGCm+GwCOlo3QgoDaInPRrBsgvAG0BbfuglCG8CK+GwCOlqrBh/k5NDORyBsBbCY/WwvS1UgZAWwLD6bwMoxXAXwIr6VKhCqAngR30r20zxCGcAS2K25WDFrmCXACtAt4dfntZeCj+sJeXvvVXgrnF1XgCjia1YB7AGspKLSPNwZgLL+9vPlFiX7lXQvt3VlgKiia8blxgALSO9vxcFoXCNg3gAkPJX8a2Hi0y0Cpg2wyPpWBEH6tWI1a4AFECr5X38FkdpWGOa+CLqX+9YazyZonbfF1sVszBmgSQ2iN9FcOWHGAKXkv/8LhzIdgl/RdfdnTewBivg8bRKfTMAln/tx7E5AvQI8iM8hogIwiaFHExVgaIQY/CkB1QpQsp9LfZKs//P5SxHl0+8fpa3RUKsAD+JrRI97Kv8kjDOfhAic/ZTxMuvZd9rZT/NQWQJK9jOJwEerwjNytSWAJ3A/Bs7+RZwG36hUgMIhkfCtcs8VonW+sBrUmG6ATOWfNJPCstjr/kHa7hp2ugF2zcrxRWdF1vphqI09gGPB5dSl+NQv38u2rArUlu/leDPaMEAnylLgo0NqZT/Nc+oSkG39l0ZoZbmm+DQ/VACpUsL21AqQjS9n/Xp54H4LPGCATipYEvVISFgCjtA6ce06+08MMfQjqACd8EqhuRrIvk636T4MKkB3pM8HZHPQVdpPADQHGIAoTHpJ8SfdcvM26n8fIPN3AxYqgLoByKIZTWBBfGJvwgA0EXp5NoLc8MlSz/2yj2KFAYjCpNdoY7HIHA6LLfu5j6+howUTpHgMJNALE8jfIpISHX+YwkJL8ekW9OI+vuZ/r+6/KQxAiB9M0JH7GUEtZD8hSPUY2IS+rggdzUFDnTFI5yk0h0tTAZoEBp2oiV7rG3T73cOmqgBE5V4FOq75u0kbvTCdAWbqQJs+3vjNvO+Re8EAR2hdvNaiIdLtAcrjIJaBu53TGeBiEh/6uMVN3zqAvAaoPfoNrgoWDYE9wDolkr2HAVjwwdnPt7F2hAGsKTJ5PjkNUFv/J4C3+BiYygDlEXCC2F5uYeoHIaOh3Q1Qy36l9b/5n1OjQYjx01SApvgCRsZmGgM0xVXK/uZ8Jp9IYQCs/W1X5fomMHm212wQvgKU7KfNX20DWKOSqC+0ARbis6gwApO4H8MaoIi/CFe8QTWIbYAitWGhN01aghjXCLkJLGBb4mMzWBwVbgnYFL+EjgYRCGWAIv4zbY1l/645P4vn4rkwBliAROnfbYsQBoD4u/V+uDCEAR6iWncYK/vr6Wm+d2+ARfbXSDoQfzOGWlyd+tw+BhZovN47ELqTZl2HcfmDkAfxGYlzE2j8QMTdEtAUn0zA1YANgeMmAVcGKOJvhuXzAo343BhgAQeZ3s3hbgzQLWLjAy2MPmGuLjaBCyjPst/5JlDqPWtDaL4CLMSXhIK3Z8Vt3gALnZNkP8c8wwR+DJBM/FkmcPtNIAPq+Ucey5jGGrIS9N4bmK4AMnBjmoSZjmkDhKHcMZDeSWHWAA+B1h7xan0dYWcYyqwBqvBJcIheRXO20+QmcJH9cvfP4vPxbNT4XCHgqwKQGaQhShhonCXgywBno8TnmgRggCaaHCfMGaC5/ks9sAxIGpfa5gxwKRp8+DCBv3dUm8SbWwc/AAAAAElFTkSuQmCC"},"3830":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAC/UlEQVR4Ae3Z623bMBQG0LToUl2g43SYjNMFMlbaW5gIIdgSRfHSgnXyR4rN5/muKSN5e/NDgAABAgQIECBAgAABAgQIECBAgAABAi8u8O3F9/e07X38/vV5ZPKf73+mZPPjyCL1/RI4GvjXSHPvplTZ3C3Nmy0j9Fmf/KKkAIpE4zUj9DL17PBjXgVQ9DeurxZ82a4CKBIr11cNP7asAJ4UfEz7jCN/uV0FsBT593vmJz6mO0PwZdsKoEjcrlcKP7asAKoCuFr4CuAWfnbwMc2Zjv3btv9fLn8CnCH8I2s4WliX/lPwEfj6U7R2vxbQjPnX1hbvXfYEWOKvBbWGuBynbrscc61t3a/1fjl+a7+63SULoAQxArBgljHL73Et4997r27Xc1/G7ulb97lkAdQAI+8zgr63vlHhx9jf703gtT6BkcH0rWB/LyfAfrOmHhmnQUaBOQGa4tzfKCOs/avY7uEE2DY63GLEaZBVUArgcLxtAxwpgqzwY+UKoC2/Ya32FkJm+LEp3wGGRTt+oOzwY8VOgPG5bY7YcgrMCF8BbEaV12CtCGaFH7vzCMjLuGvkmeHHAi/938CuhBI7tYRfnxwt7beW6zvAllDi+3WYPdOMKACPgB75E/QZEX5sQwGcIMy9SxgVfszrEbBXf3D7vY+BkeErgMFh9g7XWgSjw4/1egT0pja5X0b4sQWPgMlBPppu7RTICj/W4gR4lMhJXs8MXwGcJORHy8gOP+b1CHik/4TX68fAjPBjix4BTwh6a8pZ4SuArSS8T4AAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIDAhQX+At0RlfKZbdHoAAAAAElFTkSuQmCC"},"3831":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABv0lEQVR4Ae3WwQ2CQBAFUDQWY0t2YA161hrswJbsRjNGEiKsoheSmcdlCXDYef9D6DoHAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQLLC6yW38LCO9ju7s0d3K7pfTbN4TPf+BR65rknZqtVAMGPKpD+E/ec+J/gC3z+w2Y9qkSmCxH8IPz9+ThvuiLhB0beAgyCj0Fnhx8PFzpyFuAt/D7Py+HUn7bXQm9/IOT7CWyE3078dadY8L1Hzp/AX0tQNPwoQc4C9PWOdaoMhQMf0jgnQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIEvgs8AF3EH4B7xwP9AAAAAElFTkSuQmCC"},"3832":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABoElEQVR4Ae3TQQrCMBBA0QjerIfxTB7Gs1UKDmKbYLFdJONzE0ipOO+PpfgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBA4ITOU2H3g93avXdBNVBhK9gvK6urQfjf2kFf1R7mln/qVYKoxW9IARPyTe5/AL8C16jCp+SHyewy3A3uAxpvAhUT+7XwDB6+HOuu1yAdbR/YvPyr39nm4WYB19+anCb4OlvFni1xYg5bCGIkCAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIEDgDwSefPcbsCsFNkkAAAAASUVORK5CYII="},"3835":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAD5klEQVR4Ae2ZS47UMBBAAcGGW3A94DjA9bgFGxagQipheTyJHbs+cV5v3N1J7Kr3yp+ZfvOGFwQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAAEIQAACEIAABCAAAQhAAAIQgAAEIAABCEAAAhCAAAQgAIFbE/j26fMf6wTeWQ9A/9cIeMi/FhlPmRMQ+V4FwApgrnNsAC/xGhUFoCQStN7yJeX3CfJ+fAgR4hU6BaAkAtpI8ZruW31D60OgV/rXnz9c3LACOHjvle4QyoshKIAXSOa/yCy8zo4CqIkMfr6T7FZqFECLSuM7C9FfPnz8N9L3378aI/p8RQE0OFvIrofJIF9iogAKMx7iZbgs8iWWRxeAl3ABra9M8iWmxxVAhPRSfuR+r3GU7WMKIFK8ANeZX8LP8H7rAoiWroJVfrbZL/Ft+2sg8rX8jtvtVgDEHwuvr7r84FAPuvpzFuma16ol3+MHoVuvALuK10LyaG9ZAFnFi7CMB72jQrrdITCrfBF/Vb5uGUeirK7d6gyQTf4KKSL/qHCszwG32AJ2FL+ieFb0kX4LQP4Kza/3kXYFQPzr0lZeSXcGeJr4szOAyLY8B6TfAlZW+0hfIibydD4S68y9aVaATDNfxR+dzmegl8/2rAByv9UqkOIMkEW+p/iyCCLfh28ByO/Tb8UptACskupD+v+uJ858zT7sDJBBfrT43v1fZUm7+iwQsgIgv1Q69n41O/dD4JUEzqp+tM/omT+m3PZu1y3gTNSZ6DMUZ/3L81nkX1n+y/xnWWlfbgXQkrMqCU1G29ZYci2LfI1l9v8MK/i5bAG1kBWBq+zeNpP83pg97jNfAaLkl+Nmkz+7/JeFMTuZTP8KKCVI0LPBlomPvp9dbkfH87q/Zjw6rtkWUAYWKV6AZJK/cvaPym7db7oCiPho+a2kd/uunGyjuZmfAUYDWnX/DJRVMdT9WM/+K5PNbAuok/f8fCT/DNLRs545eI215QpQSzyTXsOun6+vX/lsPfs1ptFcTc8AGlRkOwpEYr3yzFGOIj/ra7sCKGfvjMiZZ1uyM/0lUsa3XQFocisEruhD4skqX2Lb8gwgia18lavKyn4t+hot2m1XAAu4O/ZJAXRYHZ1VHV2muYUCSKMiJpC/HuAl4PT7pyUAAAAASUVORK5CYII="},"3837":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACoElEQVR4Ae3azVXCQBQGUPRYhFW4c0EDVmAdbqzDjXVYgQ2wcGcVdqGwSAwBhhnmhMyD64YkM8nJu+/Lj+hi4YcAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECFyXwE3kcl+XD7/D839bfYeuZ1jLuZZDgY0bnkIShpTO/1jzAShp+qas58f7vrrl+2fz9fUnO9NC00ClzR8adkEQgqHK7nKzATi1+W79u01ObblLDUYZ0/TTO9XkHWDf1a/Jpzc5tWeoO8C+YBwqTmAOyWxvDxGAkmZ2L3/rz/47Ai+C200frt0OV1pYPnSVH9o+PuePr5/xJusJgeYCkDjX7KFNCIZBWL089XeD7INcycSmHgG5V/mx3nSPjPXnsalXP97UbwG1Aegaf/VdLQBoJgA1zdf4go6Ppl7kO8CoRqsJgSYCUHP1J2ozlCHQRAAyztOUiQRmD4Crf6LOZh521gBofmaXJpw2WwA0f8KuFhx6tgAUnKOpEwoIwIS4EQ4tABG6NOE5hg+AbwHr0hE+AHXl2zt0AFz99QEOGwDNr2/+5ghN/T/AsZI0/ZhQ+XiIAGh8eWNz9wj7CMgt0Ly0gACkfS5+VAAuvsXpAkMEwB+O0k2sGQ0RgJoC7ZsWmC0A3uzTjTnX6GwBKC3QY6BULG/+H9QSV9EfkhOnAAAAAElFTkSuQmCC"},"3838":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3839":{"type":"canvas-datauri","data":"data:image/png;base64,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"},"3840":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAABnklEQVR4Ae3WvQ2DMBAGUCer0DJNpggThSkyDW1mSUQBSoFk8iMQd8+NLWRx+N0ni1IMAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIENhB4LRDzU1KXu/D85tC/aUNa7LkEe6wtcbfmrZ0j2HJYn6WKQTn+dQJFmPz14xaiNa84yh7UgXgKE3Z8jvDBSDT9f2PoIT7B5hQfr3GswQpbACmIIzzJ2HI0vh3H2sCBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBGoCL2bRF/F/fUKSAAAAAElFTkSuQmCC"},"3841":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACIklEQVR4Ae3WUVLDIBAA0NbxLJ7QY3jCXqbKx87sMAStMYHK8ycEFgJvN6mXiz8CBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAIFdAtdds3dOvr+932OJ6+1jcy8R14sp60RcrFmu383JsSu2N9GPxohklQTldn5u9Oe+0m4lNWLzWOnL9/U67r8sRyBsJSv2koui9OUk1nPr+1ijXHtjOW7l9pAC6IFH0nJMLoDSX8fU43luie2N59gV268zHbpObNlbK3mtvpnO8Ux7eXmmzf5mr4qlrzbNT8BP3/7+cYw+KvDvvwCPgqwWP8UXwNs/ruyGfwFayR/Hsd6ThxdAi9w/bi2VY/qmLIBjjmrVlsDQAvD5b6Xk3L6hBXDuUT2tJTCsAPLbn3/zc7u1YX1/KzCsAOIYkfC4Rr/rOQJDC0DSz0mypxAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgMKPAJzjrYycRtD/PAAAAAElFTkSuQmCC"},"3842":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACL0lEQVR4Ae3YTW7CQAwGUKh6rG568m56LypXshQhqCaZ35SXzQSREPt9hqBcLjYCBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAIFTClxPWfULFf11+7jtbffz+l2ca/GBe4tw/H6BI2GXXuXZUBiAUsFOx/UM/b7kR0NgAO6VOr8eGXi28ij4fM8ApETndXTwf4W+bdUAbDUa748OPcovDT5bNQAp0WidEXqUvjf4bNcApETlOiv4KPto+HGuAQiFg9vM0KPkmuCzZQOQEjvXmeG3CD7bfcsd6zkEWoYfHRuAc+T+W2Xr8A3Ai4dvAE4yAD2++dn6e+5Y1xPoGXx26z9ASiy2jgg/WjYAiwUf5YwKP65lAEJhoW1k+NG2B0EV4bd+GDQ6/Gjdn8CKAWh16ozgs3a3gJSYtM4MP1p2C6gMvuY2MDt8A1AZ/vb00kFYIfRt3X4BthoN97cDsVroDdv0UQQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIEPivAj+XPkJtusqF1gAAAABJRU5ErkJggg=="},"3843":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAADSklEQVR4Ae3bQW6cMBQGYFL1JpWyiHKVbnKK5g5d9g7JKbLpVaIuIvUs6ZiMBZoCY+MHmlG+2UAHeDbfb2ymVbvOhwABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAYHOB91+37xGNfIkoosa+AlHhp14bAPtm19xaZPgGQHMc11/g6/Xfwue4g+gnP6vd5B3byxWYCv/m51tIdt4BLjf3vmdT4Ud2OWQURXZIrUFgLvyopz+15B1g8L6Yvbngt+igJWAL1Yaae4afumkJaAgr6tKa0COnfwMgKsGGOtHh53qlA8U7QEN4LZfmoFpq5GtbalkCsuJO27VhnT7RS3VOz126NQNgSSfw2FJggc10NeGndi0BkfoTtfYKfqLpoq/MAEVMdSetDv3720dDv2/rGjyeXfv0p8sMgFXU8xdVhZ8Dny83HDkzKNaEn4pbAgbi5r2i8GtCL+zR2vBTeTNAIfK5086GvyL4x7+v3dOfh8WmW8JPhQ2ARd6yg9cafro7/xZQlvHsWVuFP9vg8UDrk5/rGwBZYovtimm/pBtR4ae2DIAS8TXnXEH4BsCaYEfXzE7/G4U/ajps18/AMMp1hdKbfvo8fbvvuvxb/2661uPdy+HA4bzAjwEQiNmXqnj6c/j9dTn8UX8+Ah99scGud4ANUGtLnv7WP/1zrvf8cB/+sz28YO7sZ9lOvgcUzgJ5BpgLPPJtfy4PS8CcTMv3h+k8T9/92n6s9V/gM2v9HsHn2zMAssTKbQrrdBbI4fclx2v7TOC56eG62Be9XH9qawmYUlnx3XgQDEEe3u7P/F3++NzU7Bbr/NLtGABLOpXHxoOg5NI81f94ee3/r//e4ac+GgAlSVWeszQQcuiVJZ1OgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgMBFCvwDe72qeHlfBKEAAAAASUVORK5CYII="},"3844":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAACLElEQVR4Ae3YQU6DQBQG4KkxHqQXcOWd9BT2RF7ElUm3epWaaTM6UKS0K3nvI2mYAiV53/+AoaVYCBAgQIAAAQIECBAgQIAAAQIECBCIL7CJX+KpwsNHObRaN48lTd2t5r/WKSD68BuEJjhJhG+AqfA1QRMo5e53GG/Uh7972pb6sQwFQjfAy+d+WK1vZwL3Z1sCbHh+2/9M+Fo5u/evNrTuBELfAbo6J4f1EdE/JiYPCr4x/CSw5rck5EtvBe0cl45bW7+kaIClTTAOr4bdgm/7ojVAmkfALcG9PmwHc4lbztEa57+u0zTA+Equgcy9Fh5fG7uJY8Twq0GaBqjFLl3GjRE1/OqRfg7QX+l98O21MXL4tQFC/g9QC7tmmQq+/j56+Mcar4Fa+7FT84C5mjI0QKo5QIZA5xp6al+aOUBf/JI7gWbpxYwJECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAisT+Aa54kKvta7rSAAAAABJRU5ErkJggg=="},"3846":{"type":"canvas-datauri","data":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAC5ElEQVR4Ae3Z3Y3UMBQG0AFREy8UBCVQAiVAQbzQFMsgbHkjJ+PfxMOekVbxJE5in/vFWWluNx8CBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECBAgQIECAAAECb0Xg3RIT/frjdxzHt89rjCkO6P9uXIudFj7nLAw5laH7rgnAo8KnUxSCVGN4+9wA1BQ+N1VhyKl07TsnAL2FT6coBKlGd3t+AEYWP0xXCIJE9/ZD9xX2LjCj8Hv3sr9ZYM4KcEbxrQLNRU9PHB+AM4ofZiAEQaJ5O+4VcGbhm6frxK3AmBXgyuJbBbY1rfr+vqp3rvOVxc+Nx74qgf4AVN1uQmcB7ELtewWshO9V0BSE9gCsVPwwdSEIEsXb538FFE9Vx5xAWwA2T/+Xj59u97+mz8indjOupvG8sZPaApAghcJ///Uz2VvYHFn8cEshCBJF2+4A3O+yV/wQjuxI0uKn7Wznyp1CUAzWFYB7gfeKXzyCWR2FoEi2PgD/YB8V//D46Cd+b6pCsCcT99cHIJ76JA0hOCxUUwAOn+4/tzs8ftbTfzhtB4NAfQB6Cnh07tGxMNrWrVVgV67p5+Dqf/xmFnd3ag6UCNSvACVXTfusUnyrQFqV2G4LwIOixhXiQb84Co3LBNp/DApD3j5ZPUXfXivcY+S2Z3wjx7HItfoDMHois0MgAK8q1vYKeHWJJ/syO2BPxrFeADyhp0ZovQCcMX2rQFReMwBWgVig2Y01AzB71vfrWwX+Kr8AmY12XrD5Oi0AAAAASUVORK5CYII="}}}</script>
+    
+  
+</body></html>
